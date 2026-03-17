@@ -1,0 +1,67 @@
+# ── Virtual Environment ──
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ── Python cache ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# ── Distribution / packaging ──
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# ── Environment variables ──
+.env
+.env.local
+.env.production
+
+# ── Pytest / testing ──
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# ── Jupyter notebooks ──
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE ──
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ── OS files ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ──
+*.log
+logs/
+
+# ── Model files (large binaries) ──
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+models/
+
+# ── Uploaded / processed data files ──
+uploads/
+data/
+*.csv
+*.xlsx
+*.json
