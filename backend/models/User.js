@@ -1,35 +1,23 @@
-const mongoose = require("mongoose");
-
-const userSchema = new mongoose.Schema(
-  {
-    uid: {
-      type: String,
-      required: true,
-      unique: true, // Firebase UID
-    },
-    name: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    email: {
-      type: String,
-      required: true,
-      unique: true,
-      lowercase: true,
-      trim: true,
-    },
-    provider: {
-      type: String,
-      enum: ["email", "google"],
-      default: "email",
-    },
-    createdAt: {
-      type: Date,
-      default: Date.now,
-    },
+// ════════════════════════════════════════════════════════════════
+//  User.js
+// ════════════════════════════════════════════════════════════════
+const mongoose2 = require("mongoose");
+ 
+const userSchema = new mongoose2.Schema({
+  uid:   { type: String, required: true, unique: true },
+  name:  { type: String, required: true, trim: true },
+  email: {
+    type:      String,
+    required:  true,
+    unique:    true,
+    lowercase: true,
+    trim:      true,
   },
-  { timestamps: true }
-);
-
-module.exports = mongoose.model("User", userSchema);
+  provider: {
+    type:    String,
+    enum:    ["email", "google"],
+    default: "email",
+  },
+}, { timestamps: true });
+ 
+module.exports = mongoose2.model("User", userSchema);

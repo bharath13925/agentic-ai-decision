@@ -1,67 +1,44 @@
-# ── Virtual Environment ──
-env/
-venv/
-.venv/
-ENV/
-env.bak/
-venv.bak/
-
-# ── Python cache ──
+# python cache
 __pycache__/
-*.py[cod]
-*$py.class
 *.pyc
 *.pyo
 *.pyd
 
-# ── Distribution / packaging ──
-dist/
-build/
-*.egg-info/
-*.egg
-.eggs/
+# virtual environment
+venv/
+env/
+.venv/
+aienv
 
-# ── Environment variables ──
+# environment variables
 .env
-.env.local
-.env.production
 
-# ── Pytest / testing ──
-.pytest_cache/
-.coverage
-htmlcov/
-*.xml
-
-# ── Jupyter notebooks ──
-.ipynb_checkpoints/
-*.ipynb
-
-# ── IDE ──
-.vscode/
-.idea/
-*.suo
-*.user
-
-# ── OS files ──
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ── Logs ──
+# logs
 *.log
-logs/
 
-# ── Model files (large binaries) ──
+# model artifacts
+models/
 *.pkl
 *.joblib
-*.h5
-*.pt
-*.pth
-models/
 
-# ── Uploaded / processed data files ──
-uploads/
+# dataset files (optional - if large)
 data/
-*.csv
-*.xlsx
-*.json
+datasets/
+
+# faiss indexes
+*.faiss
+*.index
+
+# shap outputs
+*.html
+
+# checkpoints
+checkpoints/
+
+# jupyter
+.ipynb_checkpoints/
+
+# editor files
+.vscode/
+.idea/
+.DS_Store

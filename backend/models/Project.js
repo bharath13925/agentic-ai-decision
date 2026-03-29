@@ -1,81 +1,79 @@
 const mongoose = require("mongoose");
 const crypto   = require("crypto");
 
-const projectSchema = new mongoose.Schema(
-  {
-    /* ── Identity ── */
-    projectId: {
-      type: String,
-      unique: true,
-      default: () => "AI_" + crypto.randomBytes(4).toString("hex").toUpperCase(),
-    },
-    projectName: { type: String, required: true, trim: true },
-    uid:         { type: String, required: true },
-
-    /* ── Raw uploaded filenames (multer) ── */
-    files: {
-      ecommerce:   { type: String, default: null },
-      marketing:   { type: String, default: null },
-      advertising: { type: String, default: null },
-    },
-
-    /* ── Cleaned filenames (Python microservice output) ── */
-    cleanedFiles: {
-      ecommerce:   { type: String, default: null },
-      marketing:   { type: String, default: null },
-      advertising: { type: String, default: null },
-    },
-
-    /* ── Engineered feature filenames (Python feature engineering output) ── */
-    engineeredFiles: {
-      ecommerce:   { type: String, default: null },
-      marketing:   { type: String, default: null },
-      advertising: { type: String, default: null },
-    },
-
-    /* ── Computed KPI summary (stored after feature engineering) ── */
-    kpiSummary: {
-      avgCTR:           { type: Number, default: null },
-      avgConversionRate:{ type: Number, default: null },
-      avgCartAbandonment:{ type: Number, default: null },
-      avgROI:           { type: Number, default: null },
-      totalRevenue:     { type: Number, default: null },
-      totalClicks:      { type: Number, default: null },
-      totalImpressions: { type: Number, default: null },
-    },
-
-    /* ── User-selected business objective (Step 2) ── */
-    objective: {
-      type: String,
-      enum: [
-        "increase_revenue",
-        "reduce_cart_abandonment",
-        "improve_conversion_rate",
-        "optimize_marketing_roi",
-        null,
-      ],
-      default: null,
-    },
-
-    /* ── Pipeline status ── */
-    status: {
-      type: String,
-      enum: [
-        "uploaded",     // files saved to disk
-        "cleaning",     // Python: removing nulls/duplicates
-        "cleaned",      // Python done — ready for feature engineering
-        "engineering",  // Python: computing CTR, ROI etc.
-        "engineered",   // Feature engineering done — ready for ML
-        "analyzing",    // ML pipeline running
-        "complete",     // Full pipeline done
-        "error",
-      ],
-      default: "uploaded",
-    },
-
-    errorMessage: { type: String, default: null },
+const projectSchema = new mongoose.Schema({
+  projectId: {
+    type:    String,
+    unique:  true,
+    default: () => "AI_" + crypto.randomBytes(4).toString("hex").toUpperCase(),
   },
-  { timestamps: true }
-);
+  projectName: { type: String, required: true, trim: true },
+  uid:         { type: String, required: true },
+
+  files:           { ecommerce: String, marketing: String, advertising: String },
+  cleanedFiles:    { ecommerce: String, marketing: String, advertising: String },
+  engineeredFiles: { ecommerce: String, marketing: String, advertising: String },
+  fileHashes:      { ecommerce: String, marketing: String, advertising: String },
+
+  kpiSummary: {
+    avgCTR:             { type: Number, default: null },
+    avgConversionRate:  { type: Number, default: null },
+    avgCartAbandonment: { type: Number, default: null },
+    avgROI:             { type: Number, default: null },
+    totalRevenue:       { type: Number, default: null },
+    totalClicks:        { type: Number, default: null },
+    totalImpressions:   { type: Number, default: null },
+  },
+
+  /*
+   * FIX B/C + FIX AA: datasetStats stores per-feature statistics computed
+   * during feature engineering (/engineer-features → app.py).
+   *
+   * Structure:
+   *   {
+   *     "<feature_name>": { median, mean, std, max, min },
+   *     "_max_pages": <float>,   ← population max for engagement_score normalization
+   *     "_max_time":  <float>,   ← population max for engagement_score normalization
+   *     "channel_conv_rates": {  ← real per-channel conversion rates
+   *       "Google Ads": 20.45, "Facebook Ads": 22.43, ... (also keyed by int)
+   *     },
+   *     "segment_conv_rates":    { "0": 1.0363, "1": 0.9770 },
+   *     "segment_abandon_rates": { "0": 0.9842, "1": 1.0101 },
+   *   }
+   *
+   * Usage:
+   *   - Passed to simulation_agent so the base feature vector uses real
+   *     dataset medians instead of hardcoded _SAFE_DEFAULTS.
+   *   - Passed to _build_strategy_feature_vector (FIX AA) to scale strategy
+   *     deltas from the actual observed median, not an estimated one.
+   *   - Carried forward on dedup so reused projects still have real stats.
+   *
+   * Mixed type — arbitrary feature names without schema migrations.
+   */
+  datasetStats: {
+    type:    mongoose.Schema.Types.Mixed,
+    default: null,
+  },
+
+  status: {
+    type: String,
+    enum: [
+      "uploaded", "cleaning", "cleaned", "engineering",
+      "engineered", "analyzing", "ml_complete", "complete", "error",
+    ],
+    default: "uploaded",
+  },
+
+  reusedsDatasets:     { type: Boolean, default: false },
+  reusedFromProjectId: { type: String,  default: null },
+  errorMessage:        { type: String,  default: null },
+}, { timestamps: true });
+
+// Compound index for dedup lookups
+projectSchema.index({
+  "fileHashes.ecommerce":   1,
+  "fileHashes.marketing":   1,
+  "fileHashes.advertising": 1,
+});
 
 module.exports = mongoose.model("Project", projectSchema);

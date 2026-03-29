@@ -5,24 +5,26 @@ node_modules/
 .env
 
 # logs
+logs/
 *.log
 npm-debug.log*
 
-# temporary files
+# uploads (IMPORTANT for your dataset issue)
+uploads/
+backend/uploads/
+
+# model files (ML models generated)
+*.pkl
+*.joblib
+
+# temp files
 tmp/
 temp/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
+# editor files
 .vscode/
 .idea/
+.DS_Store
 
-# build
+# build (if any)
 dist/
-build/
-
-# nodemon
-nodemon-debug.log

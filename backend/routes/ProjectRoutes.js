@@ -3,25 +3,29 @@ const router  = express.Router();
 const multer  = require("multer");
 const path    = require("path");
 const fs      = require("fs");
-
 const {
   uploadDatasets,
   resumeProject,
   getProjectStatus,
-  runFeatureEngineering,
   saveObjective,
+  saveSimulationMode,
+  runFeatureEngineering,
   getUserProjects,
 } = require("../controllers/ProjectController");
 
-/* ── Multer config ── */
-const uploadsDir = path.join(__dirname, "../uploads");
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+const uploadsDir    = path.join(__dirname, "../uploads");
+const cleanedDir    = path.join(uploadsDir, "cleaned");
+const engineeredDir = path.join(uploadsDir, "engineered");
+const modelsDir     = path.join(uploadsDir, "models");
+
+[uploadsDir, cleanedDir, engineeredDir, modelsDir].forEach((dir) => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
-  filename:    (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.fieldname}${path.extname(file.originalname)}`);
-  },
+  filename:    (req, file, cb) =>
+    cb(null, `${Date.now()}-${file.fieldname}${path.extname(file.originalname)}`),
 });
 
 const upload = multer({
@@ -42,24 +46,12 @@ const csvUpload = upload.fields([
   { name: "advertising", maxCount: 1 },
 ]);
 
-/* ── Routes ── */
-
-// POST /api/projects/upload
-router.post("/upload", csvUpload, uploadDatasets);
-
-// GET  /api/projects/resume/:projectId   ← resume by Project ID
-router.get("/resume/:projectId", resumeProject);
-
-// GET  /api/projects/status/:projectId   ← poll pipeline status
-router.get("/status/:projectId", getProjectStatus);
-
-// POST /api/projects/engineer/:projectId ← manually trigger feature engineering
-router.post("/engineer/:projectId", runFeatureEngineering);
-
-// POST /api/projects/objective/:projectId ← save business objective
-router.post("/objective/:projectId", saveObjective);
-
-// GET  /api/projects/user/:uid           ← get all user projects
-router.get("/user/:uid", getUserProjects);
+router.post("/upload",                     csvUpload, uploadDatasets);
+router.get("/resume/:projectId",           resumeProject);
+router.get("/status/:projectId",           getProjectStatus);
+router.post("/objective/:projectId",       saveObjective);
+router.post("/simulation-mode/:projectId", saveSimulationMode);
+router.post("/engineer/:projectId",        runFeatureEngineering);
+router.get("/user/:uid",                   getUserProjects);
 
 module.exports = router;
