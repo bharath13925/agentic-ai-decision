@@ -42,3 +42,5 @@ checkpoints/
 .vscode/
 .idea/
 .DS_Store
+
+uploads/

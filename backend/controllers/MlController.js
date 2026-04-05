@@ -6,7 +6,13 @@ const AgentResult = require("../models/AgentResult");
 const UserAction  = require("../models/UserAction");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
-const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "../uploads");
+
+// FIX ENG-4: resolve UPLOADS_DIR to absolute path
+const UPLOADS_DIR = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, "../uploads");
+
+console.log(`[MlController] UPLOADS_DIR resolved → ${UPLOADS_DIR}`);
 
 /* ════════════════════════════════════════════════════════════════
    Retry wrapper for Python microservice calls
@@ -51,6 +57,40 @@ const validateKpiSummary = (kpi, projectId) => {
     );
   }
   return { valid: issues.length === 0, issues };
+};
+
+/* ════════════════════════════════════════════════════════════════
+   INTERNAL — Auto-store RAG context after pipeline completes
+════════════════════════════════════════════════════════════════ */
+const _autoStoreRagContext = async (projectId, agentResultDoc, kpiSummary, objective) => {
+  try {
+    console.log(`[RAG:autoStore] Storing context for projectId=${projectId}…`);
+    const response = await axios.post(
+      `${PYTHON_URL}/store-agent-context`,
+      {
+        projectId,
+        agentResult: {
+          observerResult:   agentResultDoc.observerResult,
+          analystResult:    agentResultDoc.analystResult,
+          simulationResult: agentResultDoc.simulationResult,
+          decisionResult:   agentResultDoc.decisionResult,
+        },
+        kpiSummary,
+        objective,
+      },
+      { timeout: 60000 },
+    );
+    if (response.data?.status === "success") {
+      console.log(
+        `[RAG:autoStore] ✅ Stored ${response.data.stored?.length} docs | ` +
+        `FAISS vectors=${response.data.faiss_vectors}`
+      );
+    } else {
+      console.warn(`[RAG:autoStore] Non-success: ${response.data?.message}`);
+    }
+  } catch (err) {
+    console.warn(`[RAG:autoStore] ⚠️  Failed (non-fatal): ${err.message}`);
+  }
 };
 
 /* ════════════════════════════════════════════════════════════════
@@ -150,8 +190,6 @@ const getMLResult = async (req, res) => {
 
 /* ════════════════════════════════════════════════════════════════
    POST /api/ml/agent/:projectId
-   Passes datasetStats so simulation agent uses real dataset medians
-   for the base feature vector (FIX B/C / FIX AA).
 ════════════════════════════════════════════════════════════════ */
 const runAgentPipeline = async (req, res) => {
   try {
@@ -319,7 +357,6 @@ const triggerAgentPipeline = async (
       rf: 0.333, xgb: 0.333, lgb: 0.334,
     };
 
-    // FIX B/C + FIX AA: real dataset stats for base feature vector construction
     const datasetStats = project.datasetStats || null;
     if (datasetStats) {
       const maxPages = datasetStats._max_pages || "not stored";
@@ -348,20 +385,13 @@ const triggerAgentPipeline = async (
       ensembleWeights,
       learnedMechanismStrengths: mlResult.learnedMechanismStrengths ?? null,
       learnedObjectiveWeights:   mlResult.learnedObjectiveWeights   ?? null,
+      // FIX ENG-4: always send resolved absolute path
       uploadsDir:            UPLOADS_DIR,
       ecommerceEngineerFile: project.engineeredFiles?.ecommerce || null,
       featureImportance:     mlResult.featureImportance  ?? [],
       kpiPredictorPath:      mlResult.kpiPredictorPath   ?? null,
-      // FIX B/C + FIX AA: real medians + normalization maxes + channel rates
       datasetStats:          datasetStats,
     };
-
-    console.log(
-      `[AgentPipeline] v13.4 payload extras: ` +
-      `featureImportance=${payload.featureImportance?.length ?? 0} features | ` +
-      `kpiPredictorPath=${payload.kpiPredictorPath ? "✅" : "❌"} | ` +
-      `datasetStats=${datasetStats ? "✅" : "⚠️ missing"}`
-    );
 
     const response = await callPythonWithRetry(
       `${PYTHON_URL}/run-agent-pipeline`, payload, 2, 180000
@@ -409,6 +439,16 @@ const triggerAgentPipeline = async (
         `[AgentPipeline] Top: "${topStrategy}" | Confidence: ${confidence}% | ` +
         `ML-driven: ${mlDriven}`
       );
+
+      const updatedAgentResult = await AgentResult.findById(agentResult._id);
+      if (updatedAgentResult) {
+        _autoStoreRagContext(
+          project.projectId,
+          updatedAgentResult,
+          safekpi,
+          latestObjective.objective,
+        ).catch(() => {});
+      }
     } else {
       const errMsg = response.data?.message || "Agent pipeline failed.";
       await AgentResult.findByIdAndUpdate(agentResult._id, {
@@ -466,6 +506,7 @@ const triggerMLTraining = async (project, mlResult, objective) => {
         projectId:       project.projectId,
         mongoId:         project._id.toString(),
         mlResultId:      mlResult._id.toString(),
+        // FIX ENG-4: always send resolved absolute path
         uploadsDir:      UPLOADS_DIR,
         ecommerceFile:   project.engineeredFiles.ecommerce,
         marketingFile:   project.engineeredFiles.marketing,
@@ -491,7 +532,7 @@ const triggerMLTraining = async (project, mlResult, objective) => {
         learnedMechanismStrengths: d.learnedMechanismStrengths ?? null,
         learnedObjectiveWeights:   d.learnedObjectiveWeights   ?? null,
         kpiPredictorPath:          d.kpiPredictorPath ?? null,
-        pipelineVersion:           d.pipelineVersion  ?? "v13.4",
+        pipelineVersion:           d.pipelineVersion  ?? "v13.6.3",
       });
 
       await Project.findOneAndUpdate(
@@ -502,33 +543,16 @@ const triggerMLTraining = async (project, mlResult, objective) => {
 
       console.log(
         `[ML:train] ✅ Done → ${project.projectId} | ` +
-        `Ensemble=${d.ensemble.avgAccuracy}% | ` +
-        `RF=${d.models.randomForest.accuracy}% | ` +
-        `XGB=${d.models.xgboost.accuracy}% | ` +
-        `LGB=${d.models.lightgbm.accuracy}% | ` +
-        `AvgProba=${d.avgPurchaseProbability} | Rows=${d.trainingRows}`
-      );
-      console.log(
-        `[ML:train] PKL saved: RF=${d.modelPaths.randomForest} | ` +
-        `XGB=${d.modelPaths.xgboost} | LGB=${d.modelPaths.lightgbm}`
-      );
-      console.log(
-        `[ML:train] KPI Regressor: ${d.kpiPredictorPath ?? "NOT FOUND — retrain needed"}`
-      );
-      console.log(
-        `[ML:train] Top features: ${d.featureImportance
-          ?.slice(0, 3)
-          .map((f) => `${f.feature}(${(f.importance * 100).toFixed(1)}%)`)
-          .join(", ")}`
+        `Ensemble=${d.ensemble.avgAccuracy}%`
       );
     } else {
       const errMsg = response.data?.message || "Training failed.";
       await MLResult.findByIdAndUpdate(mlResult._id, { status: "error", errorMessage: errMsg });
       await Project.findOneAndUpdate(
         { projectId: project.projectId },
-        { status: "error", errorMessage: `ML training failed: ${errMsg}` }
+        { status: "error", errorMessage: `ML training failed: ${errMsg.slice(0, 300)}` }
       );
-      console.error(`[ML:train] ❌ Failed → ${project.projectId}: ${errMsg}`);
+      console.error(`[ML:train] ❌ Failed → ${project.projectId}: ${errMsg.slice(0, 300)}`);
     }
   } catch (err) {
     console.error(`[ML:train] ❌ Exception → ${project.projectId}: ${err.message}`);

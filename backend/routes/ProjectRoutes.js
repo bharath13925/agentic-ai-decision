@@ -13,17 +13,21 @@ const {
   getUserProjects,
 } = require("../controllers/ProjectController");
 
-const uploadsDir    = path.join(__dirname, "../uploads");
-const cleanedDir    = path.join(uploadsDir, "cleaned");
-const engineeredDir = path.join(uploadsDir, "engineered");
-const modelsDir     = path.join(uploadsDir, "models");
+// FIX ENG-4: resolve UPLOADS_DIR to absolute path — must match ProjectController
+const UPLOADS_DIR = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, "../uploads");
 
-[uploadsDir, cleanedDir, engineeredDir, modelsDir].forEach((dir) => {
+const cleanedDir    = path.join(UPLOADS_DIR, "cleaned");
+const engineeredDir = path.join(UPLOADS_DIR, "engineered");
+const modelsDir     = path.join(UPLOADS_DIR, "models");
+
+[UPLOADS_DIR, cleanedDir, engineeredDir, modelsDir].forEach((dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename:    (req, file, cb) =>
     cb(null, `${Date.now()}-${file.fieldname}${path.extname(file.originalname)}`),
 });

@@ -99,7 +99,9 @@ _SAFE_DEFAULTS = {
     "marketing_channel": 3.0,        # Email
     "product_category":  4.0,
     "unit_price":        691.73,     # real median
+    "quantity":          2.0,        # real median — FIX: was missing
     "discount_percent":  10.0,       # real median
+    "discount_amount":   65.815,     # real median — FIX: was missing
     "pages_viewed":      13.0,       # real median
     "time_on_site_sec":  903.0,      # real median
     "rating":            4.0,
@@ -216,7 +218,8 @@ DEFAULT_OBJECTIVE_WEIGHTS = {
 
 ECO_FEATURES = [
     "device_type", "user_type", "marketing_channel", "product_category",
-    "unit_price", "discount_percent", "pages_viewed", "time_on_site_sec",
+    "unit_price", "quantity", "discount_percent", "discount_amount",
+    "pages_viewed", "time_on_site_sec",
     "rating", "payment_method", "visit_day", "visit_month",
     "visit_weekday", "visit_season", "location",
     "engagement_score", "discount_impact", "price_per_page",
@@ -577,6 +580,11 @@ def _build_whatif_table(
 
         vec["discount_percent"] = float(disc_pct)
 
+        # FIX: update discount_amount to match new discount_percent
+        if "discount_amount" in vec:
+            qty = float(vec.get("quantity", _SAFE_DEFAULTS.get("quantity", 2.0)))
+            vec["discount_amount"] = float(disc_pct / 100.0 * price * qty)
+
         # Update normalised derived features
         pages = max(float(vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"])), 1.0)
         time_ = float(vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]))
@@ -786,6 +794,10 @@ def _apply_strategy_modifications(
         vec["discount_impact"] = float(np.clip((disc * price) / max(di_99, 1.0), 0, 1.5))
     if "price_per_page" in vec:
         vec["price_per_page"] = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
+    # FIX: recompute discount_amount whenever discount_percent changes
+    if "discount_amount" in vec:
+        qty = float(vec.get("quantity", _SAFE_DEFAULTS.get("quantity", 2.0)))
+        vec["discount_amount"] = round(disc / 100.0 * price * qty, 4)
 
     return vec
 

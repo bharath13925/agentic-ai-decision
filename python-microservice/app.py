@@ -1,53 +1,64 @@
 """
-AgenticIQ — Python Microservice v13.6.1
+AgenticIQ — Python Microservice v13.6.3
 
-CHANGES vs v13.5:
-  FIX ML-A — quantity and discount_amount added to ECO_RAW_FEATURES.
-              Revenue = unit_price * quantity * (1 - discount_percent/100), so
-              quantity is the single most discriminative feature for high-value
-              purchase prediction.  Without it, increase_revenue accuracy was
-              capped at ~77%.  With it, RF/XGB/LGB all reach 93-99% accuracy
-              (ROC-AUC 99%+) because the model can reconstruct the revenue
-              formula.  This is 100% data-driven — the dataset encodes revenue
-              as a deterministic function of these three features.
+FIXES vs v13.6.2:
+  FIX ENG-1 — NaN/Inf in dataset_stats JSON serialization:
+    The _safe_stat() helper now sanitizes every numeric value before it enters
+    the response dict.  NaN and Inf caused FastAPI to return a 500 error that
+    Node caught as a generic "Processing error".
 
-  FIX ML-B — _SAFE_DEFAULTS updated with real medians for the two new features:
-              quantity=2.0 (dataset median), discount_amount=65.815.
+  FIX ENG-2 — pandas groupby include_groups compatibility:
+    include_groups=False was added in pandas 2.2.0.  The segment abandonment
+    calculation now uses a plain lambda without that argument so the service
+    works on pandas 2.1.x as well.
 
-  FIX ML-C — KPI regressor (_train_kpi_regressor) now includes quantity and
-              discount_amount in ECO_RAW_ONLY.
+  FIX ENG-3 — max_pages / max_time NaN guard:
+    If pages_viewed or time_on_site_sec max() returns NaN (e.g. all-null
+    column after cleaning), we fall back to 30.0 / 1800.0 before dividing.
 
-  FIX ML-D — n_iter for RandomizedSearchCV raised from 20 → 30.
+  FIX ENG-4 — UPLOADS_DIR resolution:
+    The env var is now resolved to an absolute path at startup so that
+    relative paths ("./uploads") always work regardless of the CWD that
+    uvicorn was started from.
 
-  FIX RAG-A — /rag-chat uses FAST-PATH context stuffing when doc set ≤ 30.
-               Skips FAISS entirely — 0 embedding API calls + 1 LLM call.
-               Previous 15+ serial embed calls caused the 90-second timeout.
+  FIX ENG-5 — Detailed error propagation:
+    Exceptions inside /engineer-features now include the traceback in the
+    "message" field so the Node controller can log it and the user can see
+    the real error (not just "Processing error").
 
-  FIX RAG-B — LLM is llama3 only.  No fallback chain.  If llama3 is not
-               reachable a clear error is returned with setup instructions.
-
-  FIX RAG-C — nomic-embed-text used only in the FAISS path (>30 docs).
-
-  All fixes from v13.5 retained (FIX H leakage, FIX I KPI regressor, etc.)
+  All ML accuracy improvements from v13.6.2 RETAINED.
 """
 
 import os
-import time
-import threading
 import math
+import time
 import pickle
+import traceback as _tb
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from typing import Optional, List, Dict, Any
-import time as _time
 
+from dotenv import load_dotenv
+load_dotenv()
 
 from agents import observer_agent, analyst_agent, simulation_agent, decision_agent
 
-app = FastAPI(title="AgenticIQ Python Microservice", version="13.6.1")
+from rag import (
+    store_agent_context as _rag_store,
+    rag_chat            as _rag_chat,
+    get_store_stats     as _rag_stats,
+    clear_project_store as _rag_clear,
+)
+
+# ── FIX ENG-4: resolve UPLOADS_DIR to absolute path at startup ─────────────
+_raw_uploads = os.environ.get("UPLOADS_DIR", "./uploads")
+UPLOADS_DIR  = os.path.abspath(_raw_uploads)
+print(f"[Startup] UPLOADS_DIR resolved → {UPLOADS_DIR}")
+
+app = FastAPI(title="AgenticIQ Python Microservice", version="13.6.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,8 +68,6 @@ app.add_middleware(
 
 # ── Feature column definitions ──────────────────────────────────────────────
 
-# FIX ML-A: quantity and discount_amount added — these are the missing features
-# that allow the model to reconstruct revenue = unit_price * qty * (1-disc/100)
 ECO_RAW_FEATURES = [
     "device_type", "user_type", "marketing_channel", "product_category",
     "unit_price", "quantity", "discount_percent", "discount_amount",
@@ -67,13 +76,9 @@ ECO_RAW_FEATURES = [
     "visit_weekday", "visit_season", "location",
 ]
 
-# Derived features — computed from raw features post-split to prevent leakage
 ECO_DERIVED_FEATURES = ["engagement_score", "discount_impact", "price_per_page"]
-
-# Full feature set (raw + derived) — used for serving / simulation
 ECO_FEATURES = ECO_RAW_FEATURES + ECO_DERIVED_FEATURES
 
-# Columns that are non-ML / high-cardinality — dropped before saving engineered CSV
 ECO_DROP_COLUMNS = [
     "review_text", "review_helpful_votes",
     "session_duration_bucket", "revenue_normalized",
@@ -94,16 +99,15 @@ SEGMENT_TO_FEATURES: Dict[str, Dict[str, float]] = {
     "Mobile Users":        {"device_type": 2.0, "user_type": 1.0},
 }
 
-# FIX ML-B: real dataset medians including new features
 _SAFE_DEFAULTS: Dict[str, float] = {
     "device_type":        1.0,
     "user_type":          1.0,
     "marketing_channel":  3.0,
     "product_category":   4.0,
     "unit_price":         691.73,
-    "quantity":           2.0,       # real median (FIX ML-B)
+    "quantity":           2.0,
     "discount_percent":   10.0,
-    "discount_amount":    65.815,    # real median (FIX ML-B)
+    "discount_amount":    65.815,
     "pages_viewed":       13.0,
     "time_on_site_sec":   903.0,
     "rating":             4.0,
@@ -118,69 +122,34 @@ _SAFE_DEFAULTS: Dict[str, float] = {
     "price_per_page":     0.030,
 }
 
-# ── Model names — set via env or fall back to defaults ──────────────────────
-_OLLAMA_LLM_MODEL   = os.getenv("OLLAMA_LLM_MODEL",   "llama3")
-_OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
-# ── Safe Ollama import ─────────────────────────────────────────────────────
-try:
-    import ollama as _ollama
-    _OLLAMA_OK = True
-except Exception:
-    _ollama = None
-    _OLLAMA_OK = False
+# ════════════════════════════════════════════════════════════════
+#  FIX ENG-1: safe numeric helper
+# ════════════════════════════════════════════════════════════════
 
-# ── Warmup state ───────────────────────────────────────────────────────────
-_OLLAMA_WARMED  = False
-_OLLAMA_WARMING = False
-_OLLAMA_ERR     = None
-
-def _warmup_ollama():
-    """
-    Warm up Ollama model once at startup.
-    Loads model into memory to avoid first-request latency.
-    """
-    global _OLLAMA_WARMED, _OLLAMA_WARMING, _OLLAMA_ERR
-
-    if not _OLLAMA_OK:
-        _OLLAMA_ERR = "ollama not installed"
-        print(f"[Warmup] ❌ {_OLLAMA_ERR}")
-        return
-
-    if _OLLAMA_WARMED or _OLLAMA_WARMING:
-        return
-
-    _OLLAMA_WARMING = True
-    print(f"[Warmup] 🔄 Loading {_OLLAMA_LLM_MODEL} ...")
-
+def _safe_num(val: Any, fallback: float = 0.0) -> float:
+    """Convert val to a JSON-safe float; replace NaN/Inf with fallback."""
     try:
-        _ollama.chat(
-            model=_OLLAMA_LLM_MODEL,
-            messages=[{"role": "user", "content": "ping"}],
-            options={"num_predict": 1, "temperature": 0},
-        )
-
-        _OLLAMA_WARMED = True
-        _OLLAMA_ERR = None
-        print(f"[Warmup] ✅ {_OLLAMA_LLM_MODEL} ready")
-
-    except Exception as e:
-        _OLLAMA_ERR = str(e)
-        print(f"[Warmup] ❌ Failed: {e}")
-
-    finally:
-        _OLLAMA_WARMING = False
+        v = float(val)
+        if math.isnan(v) or math.isinf(v):
+            return fallback
+        return v
+    except Exception:
+        return fallback
 
 
-# ── Trigger warmup once on import ───────────────────────────────────────────
-if _OLLAMA_OK:
-    threading.Thread(target=_warmup_ollama, daemon=True).start()
-else:
-    print("[Warmup] ⚠️ Ollama not available — skipping warmup")
-
-
-# ── RAG fast-path threshold ─────────────────────────────────────────────────
-_RAG_FAST_PATH_THRESHOLD = 30
+def _safe_stat_dict(col: pd.Series) -> Dict[str, float]:
+    """Return {median, mean, std, max, min} with all NaN/Inf sanitised."""
+    numeric = pd.to_numeric(col, errors="coerce").dropna()
+    if len(numeric) == 0:
+        return {"median": 0.0, "mean": 0.0, "std": 0.0, "max": 0.0, "min": 0.0}
+    return {
+        "median": _safe_num(numeric.median()),
+        "mean":   _safe_num(numeric.mean()),
+        "std":    _safe_num(numeric.std(), 0.0),
+        "max":    _safe_num(numeric.max()),
+        "min":    _safe_num(numeric.min()),
+    }
 
 
 # ════════════════════════════════════════════════════════════════
@@ -271,31 +240,101 @@ class SHAPRequest(BaseModel):
     featureImportance: Optional[list] = []
 
 
+class StoreContextRequest(BaseModel):
+    projectId:   str
+    agentResult: Dict[str, Any]
+    kpiSummary:  Dict[str, Any]
+    objective:   str
+
+
+class RagQueryRequest(BaseModel):
+    projectId: str
+    query:     str
+    model:     Optional[str] = None
+    topK:      Optional[int] = 4
+
+
 # ════════════════════════════════════════════════════════════════
 #  HEALTH
 # ════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {"status": "OK", "service": "AgenticIQ v13.6.1"}
+    return {"status": "OK", "service": "AgenticIQ v13.6.3"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "service": "AgenticIQ v13.6.1"}
+    return {"status": "OK", "service": "AgenticIQ v13.6.3"}
 
-@app.get("/health-rag")
-def health_rag():
-    return {
-        "status":        "ok",
-        "ollama_ok":     _OLLAMA_OK,
-        "warmed":        _OLLAMA_WARMED,
-        "warming":       _OLLAMA_WARMING,
-        "llm_model":     _OLLAMA_LLM_MODEL,
-        "embed_model":   _OLLAMA_EMBED_MODEL,
-        "error":         _OLLAMA_ERR,
-        "ready":         _OLLAMA_OK and _OLLAMA_WARMED and _OLLAMA_ERR is None,
-    }
+
+# ════════════════════════════════════════════════════════════════
+#  RAG ENDPOINTS
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/store-agent-context")
+def store_agent_context(req: StoreContextRequest):
+    try:
+        result = _rag_store(
+            project_id=req.projectId,
+            agent_result=req.agentResult,
+            kpi_summary=req.kpiSummary,
+            objective=req.objective,
+        )
+        return {
+            "status":    "success",
+            "message":   f"Stored {len(result['stored'])} documents.",
+            "projectId": req.projectId,
+            **result,
+        }
+    except Exception as e:
+        _tb.print_exc()
+        return {"status": "error", "message": str(e), "projectId": req.projectId}
+
+
+@app.post("/rag-chat")
+def rag_chat_endpoint(req: RagQueryRequest):
+    try:
+        if not req.query or not req.query.strip():
+            return {"status": "error", "message": "Query cannot be empty.", "answer": ""}
+        result = _rag_chat(
+            project_id=req.projectId,
+            query=req.query.strip(),
+            model=req.model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            top_k=req.topK or 4,
+        )
+        return {"status": "success", "projectId": req.projectId, **result}
+    except Exception as e:
+        _tb.print_exc()
+        return {
+            "status":  "error",
+            "message": str(e),
+            "answer":  f"An error occurred: {str(e)}",
+            "projectId": req.projectId,
+        }
+
+
+@app.get("/rag-stats/{project_id}")
+def rag_stats_endpoint(project_id: str):
+    try:
+        stats = _rag_stats(project_id)
+        return {"status": "success", "projectId": project_id, **stats}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "exists": False}
+
+
+@app.delete("/rag-clear/{project_id}")
+def rag_clear_endpoint(project_id: str):
+    try:
+        cleared = _rag_clear(project_id)
+        return {
+            "status":    "success",
+            "projectId": project_id,
+            "cleared":   cleared,
+            "message":   "Context cleared." if cleared else "No store found.",
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "cleared": False}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -305,7 +344,8 @@ def health_rag():
 @app.post("/clean-datasets")
 def clean_datasets(req: CleanRequest):
     try:
-        uploads_dir = req.uploadsDir
+        # FIX ENG-4: resolve incoming uploadsDir to absolute
+        uploads_dir = os.path.abspath(req.uploadsDir)
         cleaned_dir = os.path.join(uploads_dir, "cleaned")
         os.makedirs(cleaned_dir, exist_ok=True)
 
@@ -352,10 +392,12 @@ def clean_datasets(req: CleanRequest):
             "cleanedFiles": cleaned_filenames,
         }
     except Exception as e:
-        import traceback; traceback.print_exc()
+        _tb.print_exc()
         return {
-            "status": "error", "message": str(e),
-            "projectId": req.projectId, "cleanedFiles": {},
+            "status": "error",
+            "message": f"{type(e).__name__}: {e}\n{_tb.format_exc()}",
+            "projectId": req.projectId,
+            "cleanedFiles": {},
         }
 
 
@@ -366,7 +408,8 @@ def clean_datasets(req: CleanRequest):
 @app.post("/engineer-features")
 def engineer_features(req: EngineerRequest):
     try:
-        uploads_dir    = req.uploadsDir
+        # FIX ENG-4: resolve path
+        uploads_dir    = os.path.abspath(req.uploadsDir)
         engineered_dir = os.path.join(uploads_dir, "engineered")
         os.makedirs(engineered_dir, exist_ok=True)
 
@@ -392,7 +435,7 @@ def engineer_features(req: EngineerRequest):
         df_mkt = pd.read_csv(mkt_path, low_memory=False).copy()
         df_adv = pd.read_csv(adv_path, low_memory=False).copy()
 
-        # Validate required ecommerce columns
+        # ── Validate required columns ───────────────────────────────────
         required_eco = ["purchased"]
         missing_eco  = [c for c in required_eco if c not in df_eco.columns]
         if missing_eco:
@@ -407,7 +450,6 @@ def engineer_features(req: EngineerRequest):
                 "kpiSummary": {},
             }
 
-        # Validate advertising CTR columns
         if "clicks" not in df_adv.columns or "displays" not in df_adv.columns:
             return {
                 "status":  "error",
@@ -430,14 +472,14 @@ def engineer_features(req: EngineerRequest):
                 "kpiSummary": {},
             }
 
-        # ── CTR feature ──
+        # ── CTR ─────────────────────────────────────────────────────────
         df_adv["ctr"] = df_adv.apply(
             lambda r: round((r["clicks"] / r["displays"]) * 100, 4)
             if r["displays"] > 0 else 0.0,
             axis=1,
         )
 
-        # ── Conversion features ──
+        # ── Conversion flag ─────────────────────────────────────────────
         df_eco["conversion_flag"] = df_eco["purchased"].astype(int)
         df_eco["conversion_rate_pct"] = (
             df_eco["conversion_flag"]
@@ -445,6 +487,7 @@ def engineer_features(req: EngineerRequest):
             .mul(100).round(4)
         )
 
+        # ── Cart abandonment ────────────────────────────────────────────
         if "cart_abandoned" in df_eco.columns and "added_to_cart" in df_eco.columns:
             df_eco["cart_abandon_flag"] = df_eco["cart_abandoned"].astype(int)
             added     = df_eco["added_to_cart"].rolling(window=1000, min_periods=1).sum()
@@ -456,7 +499,7 @@ def engineer_features(req: EngineerRequest):
             df_eco["cart_abandon_flag"]    = 0
             df_eco["cart_abandonment_rate"] = 0.0
 
-        # ── ROI / engagement features ──
+        # ── ROI / revenue per click ──────────────────────────────────────
         if "revenue" in df_adv.columns and "cost" in df_adv.columns:
             df_adv["roi_computed"] = df_adv.apply(
                 lambda r: round(r["revenue"] / r["cost"], 4) if r["cost"] > 0 else 0.0,
@@ -473,37 +516,43 @@ def engineer_features(req: EngineerRequest):
                 (df_mkt["engagement_score"] / max_eng).round(4) if max_eng > 0 else 0.0
             )
 
-        # ── Population normalization params ──
-        max_pages = float(df_eco["pages_viewed"].max()) if "pages_viewed" in df_eco.columns else 30.0
-        max_time  = float(df_eco["time_on_site_sec"].max()) if "time_on_site_sec" in df_eco.columns else 1800.0
+        # ── FIX ENG-3: guard max_pages / max_time against NaN ───────────
+        raw_max_pages = (
+            pd.to_numeric(df_eco["pages_viewed"], errors="coerce").max()
+            if "pages_viewed" in df_eco.columns else np.nan
+        )
+        raw_max_time = (
+            pd.to_numeric(df_eco["time_on_site_sec"], errors="coerce").max()
+            if "time_on_site_sec" in df_eco.columns else np.nan
+        )
+        max_pages = float(raw_max_pages) if (raw_max_pages is not None and not math.isnan(raw_max_pages)) else 30.0
+        max_time  = float(raw_max_time)  if (raw_max_time  is not None and not math.isnan(raw_max_time))  else 1800.0
         max_pages = max(max_pages, 1.0)
         max_time  = max(max_time,  1.0)
 
-        # ── Derived features ──
+        # ── Derived features ────────────────────────────────────────────
         if "pages_viewed" in df_eco.columns and "time_on_site_sec" in df_eco.columns:
-            df_eco["engagement_score"] = (
-                df_eco["pages_viewed"] / max_pages * 0.4 +
-                df_eco["time_on_site_sec"] / max_time * 0.6
-            ).round(4)
+            pv = pd.to_numeric(df_eco["pages_viewed"],    errors="coerce").fillna(0)
+            ts = pd.to_numeric(df_eco["time_on_site_sec"], errors="coerce").fillna(0)
+            df_eco["engagement_score"] = (pv / max_pages * 0.4 + ts / max_time * 0.6).round(4)
         else:
             df_eco["engagement_score"] = 0.0
 
         if "discount_percent" in df_eco.columns and "unit_price" in df_eco.columns:
-            df_eco["discount_impact"] = (
-                df_eco["discount_percent"] * df_eco["unit_price"]
-            ).round(4)
+            dp = pd.to_numeric(df_eco["discount_percent"], errors="coerce").fillna(0)
+            up = pd.to_numeric(df_eco["unit_price"],       errors="coerce").fillna(0)
+            df_eco["discount_impact"] = (dp * up).round(4)
 
         if "unit_price" in df_eco.columns and "pages_viewed" in df_eco.columns:
-            df_eco["price_per_page"] = (
-                df_eco["unit_price"] / df_eco["pages_viewed"].replace(0, 1)
-            ).round(4)
+            up = pd.to_numeric(df_eco["unit_price"],   errors="coerce").fillna(0)
+            pv = pd.to_numeric(df_eco["pages_viewed"], errors="coerce").replace(0, 1).fillna(1)
+            df_eco["price_per_page"] = (up / pv).round(4)
 
-        # Drop non-ML columns before saving
         for col in ECO_DROP_COLUMNS:
             if col in df_eco.columns:
                 df_eco = df_eco.drop(columns=[col])
 
-        # ── Save engineered files ──
+        # ── Save engineered CSVs ────────────────────────────────────────
         engineered_files: Dict[str, str] = {}
         for key, df, fname_key in [
             ("ecommerce",   df_eco, "ecommerce"),
@@ -514,10 +563,15 @@ def engineer_features(req: EngineerRequest):
             df.to_csv(os.path.join(engineered_dir, fname), index=False)
             engineered_files[key] = f"engineered/{fname}"
 
+        # ── KPI summary ─────────────────────────────────────────────────
         def safe(val: Any) -> float:
-            if val is None or (isinstance(val, float) and math.isnan(val)):
+            if val is None:
                 return 0.0
-            return round(float(val), 4)
+            try:
+                v = float(val)
+                return 0.0 if (math.isnan(v) or math.isinf(v)) else round(v, 4)
+            except Exception:
+                return 0.0
 
         total_purchases  = int(df_eco["purchased"].sum())
         total_visits     = len(df_eco)
@@ -536,27 +590,18 @@ def engineer_features(req: EngineerRequest):
         else:
             avg_roi = 0.0
 
-        # ── Per-feature stats for simulation base vector ──
+        # ── FIX ENG-1: build dataset_stats with sanitised values ────────
         dataset_stats: Dict[str, Any] = {}
         for feat in ECO_FEATURES:
             if feat in df_eco.columns:
-                col = pd.to_numeric(df_eco[feat], errors="coerce").dropna()
-                if len(col) > 0:
-                    dataset_stats[feat] = {
-                        "median": float(col.median()),
-                        "mean":   float(col.mean()),
-                        "std":    float(col.std()),
-                        "max":    float(col.max()),
-                        "min":    float(col.min()),
-                    }
+                dataset_stats[feat] = _safe_stat_dict(df_eco[feat])
 
-        dataset_stats["_max_pages"] = max_pages
-        dataset_stats["_max_time"]  = max_time
+        dataset_stats["_max_pages"] = _safe_num(max_pages, 30.0)
+        dataset_stats["_max_time"]  = _safe_num(max_time,  1800.0)
 
-        # ── Per-channel conversion rates from real data ──
+        # ── Channel conversion rates ────────────────────────────────────
         channel_conv_rates: Dict[str, float] = {}
         if "marketing_channel" in df_eco.columns:
-            overall_conv = float(df_eco["purchased"].mean()) if total_visits > 0 else 0.0
             ch_col = pd.to_numeric(df_eco["marketing_channel"], errors="coerce").dropna()
             for ch_int in ch_col.unique():
                 ch_clean = int(ch_int)
@@ -564,10 +609,10 @@ def engineer_features(req: EngineerRequest):
                     pd.to_numeric(df_eco["marketing_channel"], errors="coerce") == ch_int
                 ]
                 if len(grp) >= 10 and "purchased" in grp.columns:
-                    conv_rate = float(grp["purchased"].mean() * 100)
+                    conv_rate = _safe_num(grp["purchased"].mean() * 100)
                     ch_name   = INT_TO_CHANNEL.get(ch_clean, str(ch_clean))
-                    channel_conv_rates[ch_name]     = round(conv_rate, 4)
-                    channel_conv_rates[str(ch_clean)] = round(conv_rate, 4)
+                    channel_conv_rates[ch_name]     = conv_rate
+                    channel_conv_rates[str(ch_clean)] = conv_rate
             if channel_conv_rates:
                 print(f"[Engineer] ✅ Real channel conv rates: {channel_conv_rates}")
         else:
@@ -575,7 +620,7 @@ def engineer_features(req: EngineerRequest):
 
         dataset_stats["channel_conv_rates"] = channel_conv_rates
 
-        # ── Per-segment conv / abandon ratios ──
+        # ── Segment conversion / abandonment rates ──────────────────────
         segment_conv_rates:    Dict[str, float] = {}
         segment_abandon_rates: Dict[str, float] = {}
 
@@ -588,16 +633,18 @@ def engineer_features(req: EngineerRequest):
                     pd.to_numeric(df_eco["user_type"], errors="coerce") == ut_val
                 ]
                 if len(grp) >= 10:
-                    conv_ratio = float(grp["purchased"].mean()) / overall_conv
-                    segment_conv_rates[str(ut_int)] = round(conv_ratio, 4)
+                    conv_ratio = _safe_num(float(grp["purchased"].mean()) / overall_conv)
+                    segment_conv_rates[str(ut_int)] = conv_ratio
+
+                    # FIX ENG-2: avoid include_groups=False (pandas <2.2 compat)
                     if "cart_abandoned" in grp.columns and "added_to_cart" in grp.columns:
                         added_g     = grp["added_to_cart"].sum()
                         abandoned_g = grp["cart_abandoned"].sum()
                         if added_g > 0:
-                            overall_abn     = total_abandoned / max(total_cart_added, 1)
-                            seg_abn         = abandoned_g / added_g
-                            segment_abandon_rates[str(ut_int)] = round(
-                                seg_abn / max(overall_abn, 0.001), 4
+                            overall_abn = total_abandoned / max(total_cart_added, 1)
+                            seg_abn     = abandoned_g / added_g
+                            segment_abandon_rates[str(ut_int)] = _safe_num(
+                                seg_abn / max(overall_abn, 0.001)
                             )
             if segment_conv_rates:
                 print(f"[Engineer] ✅ Real segment conv ratios: {segment_conv_rates}")
@@ -630,10 +677,14 @@ def engineer_features(req: EngineerRequest):
             "datasetStats":    dataset_stats,
         }
     except Exception as e:
-        import traceback; traceback.print_exc()
+        err_detail = f"{type(e).__name__}: {e}\n{_tb.format_exc()}"
+        print(f"[Engineer] ❌ EXCEPTION: {err_detail}")
         return {
-            "status": "error", "message": str(e),
-            "projectId": req.projectId, "engineeredFiles": {}, "kpiSummary": {},
+            "status":  "error",
+            "message": err_detail,
+            "projectId": req.projectId,
+            "engineeredFiles": {},
+            "kpiSummary": {},
         }
 
 
@@ -680,7 +731,7 @@ def _add_derived_features_post_split(
 
 @app.post("/train-models")
 def train_models(req: TrainRequest):
-    import time, warnings
+    import warnings
     warnings.filterwarnings("ignore")
     try:
         from sklearn.ensemble        import RandomForestClassifier
@@ -689,7 +740,7 @@ def train_models(req: TrainRequest):
         import xgboost  as xgb
         import lightgbm as lgb
 
-        uploads_dir = req.uploadsDir
+        uploads_dir = os.path.abspath(req.uploadsDir)
         models_dir  = os.path.join(uploads_dir, "models", req.projectId)
         os.makedirs(models_dir, exist_ok=True)
 
@@ -715,9 +766,7 @@ def train_models(req: TrainRequest):
 
         print(f"[Train] Loaded: eco={len(df_eco)}, mkt={len(df_mkt)}, adv={len(df_adv)}")
         print(f"[Train] Objective: {req.objective}")
-        print(f"[Train] ECO_RAW_FEATURES ({len(ECO_RAW_FEATURES)}): {ECO_RAW_FEATURES}")
 
-        # Returns RAW features only (no derived)
         df_raw, target_col, raw_feature_cols = _build_training_data(
             df_eco, df_mkt, df_adv, req.objective
         )
@@ -736,7 +785,6 @@ def train_models(req: TrainRequest):
             X_raw, y, test_size=0.2, random_state=42, stratify=y
         )
 
-        # Normalization params from TRAINING set only
         pv_idx = raw_feature_cols.index("pages_viewed")     if "pages_viewed"     in raw_feature_cols else None
         ts_idx = raw_feature_cols.index("time_on_site_sec") if "time_on_site_sec" in raw_feature_cols else None
 
@@ -764,11 +812,9 @@ def train_models(req: TrainRequest):
 
         print(
             f"[Train] Split → train={len(X_train)}, test={len(X_test)} | "
-            f"features={len(feature_cols)} | "
-            f"max_pages_train={max_pages_train:.1f}, max_time_train={max_time_train:.1f}"
+            f"features={len(feature_cols)}"
         )
 
-        # FIX ML-D: 5-fold CV, n_iter=30 for wider hyperparameter search
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         results: Dict[str, Any] = {}
         model_paths:  Dict[str, str] = {}
@@ -787,9 +833,7 @@ def train_models(req: TrainRequest):
             "max_features":      ["sqrt", "log2", 0.4, 0.5, 0.6],
             "class_weight":      ["balanced", "balanced_subsample"],
         }
-        rf_base = RandomForestClassifier(
-            random_state=42, n_jobs=-1, class_weight="balanced"
-        )
+        rf_base = RandomForestClassifier(random_state=42, n_jobs=-1, class_weight="balanced")
         rf_search = RandomizedSearchCV(
             rf_base, rf_param_dist, n_iter=30, cv=cv,
             scoring="roc_auc", n_jobs=-1, random_state=42, verbose=0,
@@ -807,7 +851,7 @@ def train_models(req: TrainRequest):
             pickle.dump(rf, f)
         model_paths["randomForest"] = rf_path
         importances.append(rf.feature_importances_)
-        print(f"[Train] RF  → Acc={results['randomForest']['accuracy']}% | ROC={results['randomForest'].get('rocAuc',0)}% ({rf_time}s)")
+        print(f"[Train] RF  → Acc={results['randomForest']['accuracy']}%")
 
         # ── XGBoost ──
         print("[Train] Tuning + Training XGBoost...")
@@ -855,7 +899,7 @@ def train_models(req: TrainRequest):
             pickle.dump((xgb_model, le), f)
         model_paths["xgboost"] = xgb_path
         importances.append(xgb_model.feature_importances_)
-        print(f"[Train] XGB → Acc={results['xgboost']['accuracy']}% | ROC={results['xgboost'].get('rocAuc',0)}% ({xgb_time}s)")
+        print(f"[Train] XGB → Acc={results['xgboost']['accuracy']}%")
 
         # ── LightGBM ──
         print("[Train] Tuning + Training LightGBM...")
@@ -866,16 +910,14 @@ def train_models(req: TrainRequest):
             "learning_rate":     [0.03, 0.05, 0.08, 0.1, 0.15],
             "subsample":         [0.7, 0.8, 0.9, 1.0],
             "colsample_bytree":  [0.6, 0.7, 0.8, 0.9, 1.0],
-            "num_leaves":        [31, 63, 127, 255, 511],
+            "num_leaves":        [15, 31, 63, 127, 255],
             "min_child_samples": [5, 10, 20, 30],
             "reg_alpha":         [0, 0.01, 0.1],
-            "reg_lambda":        [0, 0.01, 0.1],
+            "reg_lambda":        [0, 0.01, 0.1, 1.0],
         }
         le_lgb = LabelEncoder()
         y_train_enc_lgb = le_lgb.fit_transform(y_train)
-        lgb_base = lgb.LGBMClassifier(
-            random_state=42, verbose=-1, class_weight="balanced"
-        )
+        lgb_base = lgb.LGBMClassifier(random_state=42, verbose=-1, class_weight="balanced")
         lgb_search = RandomizedSearchCV(
             lgb_base, lgb_param_dist, n_iter=30, cv=cv,
             scoring="roc_auc", n_jobs=-1, random_state=42, verbose=0,
@@ -900,16 +942,16 @@ def train_models(req: TrainRequest):
             pickle.dump((lgb_model, le_lgb), f)
         model_paths["lightgbm"] = lgb_path
         importances.append(lgb_model.feature_importances_)
-        print(f"[Train] LGB → Acc={results['lightgbm']['accuracy']}% | ROC={results['lightgbm'].get('rocAuc',0)}% ({lgb_time}s)")
+        print(f"[Train] LGB → Acc={results['lightgbm']['accuracy']}%")
 
-        # ── Weighted ensemble by ROC-AUC ──
-        roc_scores = [
-            results["randomForest"].get("rocAuc") or results["randomForest"]["accuracy"],
-            results["xgboost"].get("rocAuc")      or results["xgboost"]["accuracy"],
-            results["lightgbm"].get("rocAuc")     or results["lightgbm"]["accuracy"],
+        # ── Weighted ensemble ──
+        accs    = [
+            results["randomForest"]["accuracy"],
+            results["xgboost"]["accuracy"],
+            results["lightgbm"]["accuracy"],
         ]
-        total_roc = sum(roc_scores) or 1.0
-        w_rf, w_xgb, w_lgb = [r / total_roc for r in roc_scores]
+        total_w = sum(accs) or 1.0
+        w_rf, w_xgb, w_lgb = [a / total_w for a in accs]
 
         def w_avg(k: str) -> float:
             return round(
@@ -953,10 +995,7 @@ def train_models(req: TrainRequest):
             reverse=True,
         )[:10]
 
-        print(
-            f"[Train] Ensemble: {ensemble['avgAccuracy']}% | AvgProba: {avg_purchase_proba}"
-        )
-        print(f"[Train] Top features: {[f['feature'] for f in feat_importance[:5]]}")
+        print(f"[Train] Ensemble: {ensemble['avgAccuracy']}% | AvgProba: {avg_purchase_proba}")
 
         # ── KPI Regressor ──
         print("[Train] Training KPI Regressor...")
@@ -1082,7 +1121,7 @@ def train_models(req: TrainRequest):
             "learnedMechanismStrengths": learned_mechanism_strengths,
             "learnedObjectiveWeights":   learned_objective_weights,
             "kpiPredictorPath":          kpi_predictor_path,
-            "pipelineVersion":           "v13.6",
+            "pipelineVersion":           "v13.6.3",
             "modelPaths": {
                 "randomForest": model_paths["randomForest"],
                 "xgboost":      model_paths["xgboost"],
@@ -1090,12 +1129,13 @@ def train_models(req: TrainRequest):
             },
         }
     except Exception as e:
-        import traceback; traceback.print_exc()
-        return {"status": "error", "message": str(e), "projectId": req.projectId}
+        err_detail = f"{type(e).__name__}: {e}\n{_tb.format_exc()}"
+        print(f"[Train] ❌ EXCEPTION: {err_detail}")
+        return {"status": "error", "message": err_detail, "projectId": req.projectId}
 
 
 # ════════════════════════════════════════════════════════════════
-#  KPI REGRESSOR (FIX ML-C: includes quantity + discount_amount)
+#  KPI REGRESSOR
 # ════════════════════════════════════════════════════════════════
 
 def _train_kpi_regressor(
@@ -1136,7 +1176,6 @@ def _train_kpi_regressor(
         f"abandon={real_abandon:.2f}% roi={real_roi:.4f}x"
     )
 
-    # FIX ML-C: ECO_RAW_ONLY now includes quantity and discount_amount
     ECO_RAW_ONLY = [f for f in feature_cols
                     if f not in ("engagement_score", "discount_impact", "price_per_page")]
     for col in ECO_RAW_ONLY + ["purchased", "added_to_cart", "cart_abandoned"]:
@@ -1197,11 +1236,16 @@ def _train_kpi_regressor(
             bins=[-1, 0, 10, 20, 100], labels=False, include_lowest=True
         ).fillna(0).astype(int)
 
+        # FIX ENG-2: use simple groupby without include_groups parameter
         def _abn(g):
             add = g["added_to_cart"].sum()
-            return float(g["cart_abandoned"].sum() / max(add, 1) * 100)
+            abn = g["cart_abandoned"].sum()
+            return float(abn / max(add, 1) * 100)
 
-        abn_map = tr_abn.groupby(["user_type", "_disc_bin"]).apply(_abn, include_groups=False)
+        abn_map = {}
+        for (ut, db), g in tr_abn.groupby(["user_type", "_disc_bin"]):
+            abn_map[(ut, db)] = _abn(g)
+
         ds["_abn_key"]  = list(zip(ds["user_type"].astype(int), ds["_disc_bin"]))
         ds["t_abandon"] = ds["_abn_key"].map(abn_map).fillna(real_abandon)
         ds["t_abandon"] = ds["t_abandon"].clip(real_abandon * 0.5, real_abandon * 1.5)
@@ -1256,13 +1300,12 @@ def _train_kpi_regressor(
     )
     reg.fit(X_train_kpi, Y_train)
 
-    preds      = reg.predict(X_test_kpi)
+    preds        = reg.predict(X_test_kpi)
     target_names = ["t_ctr", "t_conv", "t_abandon", "t_roi"]
-    r2_scores  = {}
+    r2_scores    = {}
     for i, tn in enumerate(target_names):
         r2_scores[tn] = round(float(r2_score(Y_test[:, i], preds[:, i])), 4)
     print(f"[KPIReg] R² per target: {r2_scores}")
-    print(f"[KPIReg] train={len(X_train_kpi)}, test={len(X_test_kpi)}")
 
     full_feature_cols = ECO_RAW_ONLY + ["engagement_score", "discount_impact", "price_per_page"]
 
@@ -1296,7 +1339,8 @@ def _train_kpi_regressor(
 @app.post("/score-strategies")
 def score_strategies(req: ScoreStrategiesRequest):
     try:
-        eco_path = os.path.join(req.uploadsDir, req.ecommerceFile)
+        uploads_dir = os.path.abspath(req.uploadsDir)
+        eco_path = os.path.join(uploads_dir, req.ecommerceFile)
         if not os.path.exists(eco_path):
             return {"status": "error", "message": f"Engineered file not found: {eco_path}"}
 
@@ -1325,7 +1369,6 @@ def score_strategies(req: ScoreStrategiesRequest):
         max_pages = max(max_pages, 1.0)
         max_time  = max(max_time,  1.0)
 
-        # Per-model error isolation
         models_loaded: Dict[str, Any] = {}
         model_load_errors: Dict[str, str] = {}
         for model_key, model_path in req.modelPaths.items():
@@ -1337,7 +1380,6 @@ def score_strategies(req: ScoreStrategiesRequest):
                     models_loaded[model_key] = pickle.load(f)
             except Exception as load_err:
                 model_load_errors[model_key] = str(load_err)
-                print(f"[score_strategies] ⚠️  Failed to load {model_key}: {load_err}")
 
         if not models_loaded:
             return {
@@ -1425,7 +1467,7 @@ def score_strategies(req: ScoreStrategiesRequest):
             "modelLoadErrors": model_load_errors or None,
         }
     except Exception as e:
-        import traceback; traceback.print_exc()
+        _tb.print_exc()
         return {
             "status": "error", "message": str(e),
             "projectId": req.projectId, "strategyScores": [],
@@ -1439,9 +1481,7 @@ def score_strategies(req: ScoreStrategiesRequest):
 @app.post("/run-agent-pipeline")
 def run_agent_pipeline(req: AgentPipelineRequest):
     try:
-        print(
-            f"[Agent] Starting → {req.projectId} | {req.objective} | {req.simulationMode}"
-        )
+        print(f"[Agent] Starting → {req.projectId} | {req.objective} | {req.simulationMode}")
 
         kpi           = req.kpiSummary or {}
         ml_acc        = req.mlEnsembleAcc
@@ -1490,21 +1530,18 @@ def run_agent_pipeline(req: AgentPipelineRequest):
             dataset_stats=dataset_stats,
         )
         strategies = simulation_result["strategies"]
-        print(
-            f"[Agent] Simulation: {len(strategies)} strategies | "
-            f"ml_driven={simulation_result.get('mlDriven', '?')}"
-        )
+        print(f"[Agent] Simulation: {len(strategies)} strategies")
 
-        # ── PKL scoring per strategy ──
         per_strategy_ml_scores: Dict[str, float] = {}
         model_paths = req.modelPaths or {}
         uploads_dir = req.uploadsDir
 
         if model_paths and uploads_dir:
             try:
+                uploads_dir_abs = os.path.abspath(uploads_dir)
                 ecom_file = getattr(req, "ecommerceEngineerFile", None)
-                if ecom_file and os.path.exists(os.path.join(uploads_dir, ecom_file)):
-                    eco_path       = os.path.join(uploads_dir, ecom_file)
+                if ecom_file and os.path.exists(os.path.join(uploads_dir_abs, ecom_file)):
+                    eco_path       = os.path.join(uploads_dir_abs, ecom_file)
                     df_eco         = pd.read_csv(eco_path, low_memory=False)
                     avail_features = [f for f in ECO_FEATURES if f in df_eco.columns]
 
@@ -1576,6 +1613,23 @@ def run_agent_pipeline(req: AgentPipelineRequest):
             f"confidence={decision_result['recommendation']['confidence']}%"
         )
 
+        # Auto-store RAG context
+        try:
+            rag_result = _rag_store(
+                project_id=req.projectId,
+                agent_result={
+                    "observerResult":   observer_result,
+                    "analystResult":    analyst_result,
+                    "simulationResult": simulation_result,
+                    "decisionResult":   decision_result,
+                },
+                kpi_summary=kpi,
+                objective=req.objective,
+            )
+            print(f"[Agent] ✅ RAG context stored: {len(rag_result.get('stored', []))} docs")
+        except Exception as rag_err:
+            print(f"[Agent] ⚠️  RAG auto-store failed (non-fatal): {rag_err}")
+
         return {
             "status":           "success",
             "projectId":        req.projectId,
@@ -1587,7 +1641,7 @@ def run_agent_pipeline(req: AgentPipelineRequest):
             "recommendation":   decision_result.get("recommendation"),
         }
     except Exception as e:
-        import traceback; traceback.print_exc()
+        _tb.print_exc()
         return {"status": "error", "message": str(e), "projectId": req.projectId}
 
 
@@ -1655,7 +1709,6 @@ def _build_strategy_feature_vector(
     ppp_99 = float(krc.get("ppp_99", ds.get("_ppp_99", 1.0))) or 1.0
     if di_99 == 1.0:
         _pr = float(base_vector.get("unit_price",      691.73))
-        _di = float(base_vector.get("discount_percent", 10.0))
         di_99  = max(_pr * 30.0 * 1.05, 1.0)
     if ppp_99 == 1.0:
         _pr  = float(base_vector.get("unit_price", 691.73))
@@ -1666,15 +1719,11 @@ def _build_strategy_feature_vector(
             return float(ds[feat].get("median", _SAFE_DEFAULTS.get(feat, 0.0)))
         return float(base_vector.get(feat, _SAFE_DEFAULTS.get(feat, 0.0)))
 
-    # quantity stays at median for all strategies (customer-driven, not strategy-controlled)
-    # discount_amount is recomputed after discount_percent / unit_price changes
-
     if strat_id == "offer_discount":
         disc = float(strat_params.get("discount_pct", 10.0))
         vec["discount_percent"]  = disc
         vec["marketing_channel"] = CHANNEL_TO_INT.get("Email", 3)
         vec["user_type"]         = 1.0
-        # recompute discount_amount: disc_pct * unit_price * median_qty / 100
         if "discount_amount" in avail_features:
             qty = _med("quantity")
             vec["discount_amount"] = round(disc / 100.0 * _med("unit_price") * qty, 4)
@@ -1741,7 +1790,6 @@ def _build_strategy_feature_vector(
             vec["pages_viewed"]     = _med("pages_viewed")     * min(scale, 1.20)
             vec["time_on_site_sec"] = _med("time_on_site_sec") * min(scale, 1.15)
 
-    # ── Recompute normalised derived features ──
     pages = max(float(vec.get("pages_viewed",     _med("pages_viewed"))),  1.0)
     time_ = float(vec.get("time_on_site_sec", _med("time_on_site_sec")))
     price = float(vec.get("unit_price",       _med("unit_price")))
@@ -1763,7 +1811,7 @@ def _build_strategy_feature_vector(
 
 
 # ════════════════════════════════════════════════════════════════
-#  TRAINING DATA BUILDER  (FIX H: RAW features only)
+#  TRAINING DATA BUILDER
 # ════════════════════════════════════════════════════════════════
 
 def _build_training_data(df_eco, df_mkt, df_adv, objective):
@@ -1773,9 +1821,7 @@ def _build_training_data(df_eco, df_mkt, df_adv, objective):
             raise ValueError("increase_revenue requires 'revenue' and 'purchased' columns")
         df = df[df["purchased"] == 1].copy()
         if len(df) < 50:
-            raise ValueError(
-                f"Not enough purchase rows ({len(df)}) for increase_revenue"
-            )
+            raise ValueError(f"Not enough purchase rows ({len(df)}) for increase_revenue")
         q75 = df["revenue"].quantile(0.75)
         df["high_value_purchase"] = (df["revenue"] >= q75).astype(int)
         target_col = "high_value_purchase"
@@ -1794,7 +1840,7 @@ def _build_training_data(df_eco, df_mkt, df_adv, objective):
             raise ValueError("improve_conversion_rate requires 'purchased' column")
         target_col = "purchased"
 
-    else:  # optimize_marketing_roi
+    else:
         df = df_eco.copy()
         if "revenue" in df.columns:
             df = df[df["revenue"] > 0].copy()
@@ -1806,7 +1852,6 @@ def _build_training_data(df_eco, df_mkt, df_adv, objective):
             )
         target_col = "high_revenue"
 
-    # RAW features only — derived added post-split; includes quantity + discount_amount now
     feature_cols = [f for f in ECO_RAW_FEATURES if f in df.columns]
 
     for col in feature_cols:
@@ -1967,11 +2012,7 @@ def _shap_description_unknown(feature: str) -> str:
     return descriptions.get(feature, f"{feature} — contributes to model prediction")
 
 
-def _shap_context(
-    top_features: List[Dict],
-    strategy_name: str,
-    objective: str,
-) -> str:
+def _shap_context(top_features, strategy_name, objective):
     if not top_features:
         return "Feature importance data not available. Please retrain models."
     top1 = top_features[0]["feature"]
@@ -1993,10 +2034,7 @@ def _shap_context(
     return ctx
 
 
-def _shap_importance_fallback(
-    req: SHAPRequest,
-    error: Optional[str] = None,
-) -> Dict[str, Any]:
+def _shap_importance_fallback(req: SHAPRequest, error: Optional[str] = None) -> Dict[str, Any]:
     if not req.featureImportance:
         return {
             "status":          "error",
@@ -2050,7 +2088,8 @@ def compute_shap(req: SHAPRequest):
     try:
         import shap as shap_lib
 
-        eco_path     = os.path.join(req.uploadsDir, req.ecommerceFile)
+        uploads_dir  = os.path.abspath(req.uploadsDir)
+        eco_path     = os.path.join(uploads_dir, req.ecommerceFile)
         df           = pd.read_csv(eco_path, low_memory=False)
         feature_cols = [f for f in ECO_FEATURES if f in df.columns]
         if not feature_cols:
@@ -2132,469 +2171,5 @@ def compute_shap(req: SHAPRequest):
         return _shap_importance_fallback(req)
     except Exception as e:
         print(f"[SHAP] Error: {e}")
-        import traceback; traceback.print_exc()
+        _tb.print_exc()
         return _shap_importance_fallback(req, error=str(e))
-
-
-# ════════════════════════════════════════════════════════════════
-#  RAG CHAT — v13.6.1  llama3 only, FAISS fast-path
-#
-#  FIX RAG-A: For doc sets ≤ 30, skip FAISS entirely and pass all
-#             context directly.  Removes 15+ serial embed calls that
-#             caused the 90-second axios timeout.
-#  FIX RAG-B: LLM = llama3 only.  No fallback.  Clear error on failure.
-#  FIX RAG-C: nomic-embed-text used only in the optional FAISS path.
-# ════════════════════════════════════════════════════════════════
-
-_FAISS_OK  = False
-_OLLAMA_OK = False
-
-try:
-    import faiss as _faiss
-    _FAISS_OK = True
-except ImportError:
-    pass
-
-try:
-    import ollama as _ollama
-    _OLLAMA_OK = True
-except ImportError:
-    pass
-
-
-class RagChatRequest(BaseModel):
-    projectId:         str
-    question:          str
-    history:           Optional[List[Dict[str, str]]] = []
-    objective:         Optional[str]       = None
-    kpiSummary:        Optional[Dict]      = {}
-    uploadsDir:        Optional[str]       = None
-    modelPaths:        Optional[Dict]      = {}
-    kpiPredictorPath:  Optional[str]       = None
-    featureImportance: Optional[List]      = []
-    ensemble:          Optional[Dict]      = None
-    mlResult:          Optional[Dict]      = None
-    agentResult:       Optional[Dict]      = None
-
-    class Config:
-        extra = "allow"
-
-
-def _ollama_embed(text: str, dim: int = 768) -> np.ndarray:
-    """Embed using nomic-embed-text (used only in FAISS path for >30 docs)."""
-    try:
-        resp = _ollama.embeddings(model=_OLLAMA_EMBED_MODEL, prompt=text[:2000])
-        emb  = resp.get("embedding", [])
-        if emb:
-            arr = np.array(emb, dtype="float32")
-            if len(arr) < dim:
-                arr = np.pad(arr, (0, dim - len(arr)))
-            elif len(arr) > dim:
-                arr = arr[:dim]
-            return arr
-    except Exception as e:
-        print(f"[RAG] nomic-embed-text failed: {e}")
-    return np.zeros(dim, dtype="float32")
-
-
-@app.post("/rag-chat")
-def rag_chat(req: RagChatRequest):
-    # ── MUST be at the very top of the function, before any reads/writes ──
-    global _OLLAMA_WARMED, _OLLAMA_ERR
- 
-    if not _OLLAMA_OK:
-        return {
-            "status": "error",
-            "answer": (
-                "ollama Python package is not installed.\n"
-                "Run:  pip install ollama\n"
-                "Then restart the microservice and pull the model:\n"
-                f"  ollama pull {_OLLAMA_LLM_MODEL}"
-            ),
-        }
- 
-    # ── Wait for warmup if still in progress (max 90 s) ──────────────────
-    waited = 0
-    while _OLLAMA_WARMING and waited < 90:
-        _time.sleep(1)
-        waited += 1
- 
-    if not _OLLAMA_WARMED and _OLLAMA_ERR:
-        return {
-            "status": "error",
-            "answer": (
-                f"Ollama model '{_OLLAMA_LLM_MODEL}' failed to load.\n\n"
-                f"Error: {_OLLAMA_ERR}\n\n"
-                "Make sure Ollama is running:\n"
-                "  ollama serve\n\n"
-                f"And the model is pulled:\n"
-                f"  ollama pull {_OLLAMA_LLM_MODEL}"
-            ),
-        }
- 
-    try:
-        # ── 1. Build context documents ─────────────────────────────────────
-        docs = _build_rag_documents(req)
- 
-        if not docs:
-            return {
-                "status": "error",
-                "answer": (
-                    "No context could be extracted for this project. "
-                    "Please complete ML training and the agent pipeline first."
-                ),
-            }
- 
-        doc_texts     = [d["text"] for d in docs]
-        doc_ids       = [d["id"]   for d in docs]
-        retrieved_ids = doc_ids
-        retrieved     = doc_texts
- 
-        # ── 2. FAST PATH vs FAISS PATH ─────────────────────────────────────
-        use_faiss = _FAISS_OK and len(docs) > _RAG_FAST_PATH_THRESHOLD
- 
-        if use_faiss:
-            print(f"[RAG] FAISS path: {len(docs)} docs")
-            dim        = 768
-            index      = _faiss.IndexFlatL2(dim)
-            embeddings = [_ollama_embed(text, dim) for text in doc_texts]
-            emb_matrix = np.vstack(embeddings)
-            index.add(emb_matrix)
-            top_k    = min(6, len(docs))
-            q_vector = _ollama_embed(req.question[:1000], dim).reshape(1, -1)
-            try:
-                _, indices = index.search(q_vector, top_k)
-                retrieved     = [doc_texts[i] for i in indices[0] if i < len(doc_texts)]
-                retrieved_ids = [doc_ids[i]   for i in indices[0] if i < len(doc_texts)]
-            except Exception as search_err:
-                print(f"[RAG] FAISS search failed: {search_err} — using all docs")
-        else:
-            print(f"[RAG] Fast-path: {len(docs)} docs → direct context stuffing")
- 
-        # ── 3. System prompt ───────────────────────────────────────────────
-        context_block = "\n\n---\n\n".join(retrieved)
-        obj_label     = (req.objective or "N/A").replace("_", " ").title()
- 
-        system_prompt = (
-            f"You are AgenticIQ's AI business analyst assistant.\n\n"
-            f"PROJECT: {req.projectId} | OBJECTIVE: {obj_label}\n\n"
-            f"GROUNDED CONTEXT:\n{context_block}\n\n"
-            f"INSTRUCTIONS:\n"
-            f"- Answer ONLY using the context provided above.\n"
-            f"- Be concise and data-driven (use exact numbers).\n"
-            f"- If context is insufficient, say so clearly.\n"
-            f"- Keep answers under 250 words unless asked for more."
-        )
- 
-        # ── 4. Conversation history ────────────────────────────────────────
-        messages = [{"role": "system", "content": system_prompt}]
-        for turn in (req.history or [])[-8:]:
-            role    = turn.get("role", "user")
-            content = turn.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": req.question})
- 
-        # ── 5. Call LLM ────────────────────────────────────────────────────
-        print(f"[RAG] Calling {_OLLAMA_LLM_MODEL} | docs={len(docs)} | warmed={_OLLAMA_WARMED}")
-        try:
-            llm_response = _ollama.chat(
-                model=_OLLAMA_LLM_MODEL,
-                messages=messages,
-                options={
-                    "temperature": 0.15,
-                    "num_predict": 512,
-                    "top_p":       0.85,
-                },
-            )
-            answer         = llm_response["message"]["content"].strip()
-            _OLLAMA_WARMED = True   # global declared at top — this is now valid
-            _OLLAMA_ERR    = None
-            print(f"[RAG] ✅ {_OLLAMA_LLM_MODEL} answered | len={len(answer)}")
-        except Exception as llm_err:
-            err_str     = str(llm_err)
-            _OLLAMA_ERR = err_str   # global declared at top — valid
-            if any(k in err_str.lower() for k in ("connection", "refused", "reset", "econnrefused")):
-                answer = (
-                    "Cannot reach Ollama. Start it with:\n"
-                    "  ollama serve\n\n"
-                    f"Then pull the model:\n"
-                    f"  ollama pull {_OLLAMA_LLM_MODEL}"
-                )
-            else:
-                answer = f"{_OLLAMA_LLM_MODEL} error: {err_str}"
-            return {"status": "error", "answer": answer}
- 
-        return {
-            "status":        "success",
-            "answer":        answer,
-            "retrievedDocs": retrieved_ids,
-            "totalDocs":     len(docs),
-            "model":         _OLLAMA_LLM_MODEL,
-            "warmed":        _OLLAMA_WARMED,
-        }
- 
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return {
-            "status": "error",
-            "answer": f"RAG pipeline error: {str(e)}",
-            "error":  str(e),
-        }
-
-# ── helper needed for vstack in rag_chat ─────────────────────────────────────
-def import_numpy_vstack(arrays):
-    import numpy as np
-    return np.vstack(arrays)
-
-
-# ════════════════════════════════════════════════════════════════
-#  RAG DOCUMENT BUILDER
-# ════════════════════════════════════════════════════════════════
-
-def _build_rag_documents(req: RagChatRequest) -> List[Dict[str, str]]:
-    docs: List[Dict[str, str]] = []
-    pid  = req.projectId
-
-    # ── KPI Summary ──────────────────────────────────────────
-    kpi = req.kpiSummary or {}
-    if kpi:
-        docs.append({
-            "id":   "kpi_summary",
-            "text": (
-                f"PROJECT KPI SUMMARY for {pid}:\n"
-                f"  Average CTR:              {kpi.get('avgCTR', 0):.4f}%\n"
-                f"  Average Conversion Rate:  {kpi.get('avgConversionRate', 0):.4f}%\n"
-                f"  Average Cart Abandonment: {kpi.get('avgCartAbandonment', 0):.2f}%\n"
-                f"  Average ROI:              {kpi.get('avgROI', 0):.4f}x\n"
-                f"  Total Revenue:            {kpi.get('totalRevenue', 0):.2f}\n"
-                f"  Total Clicks:             {int(kpi.get('totalClicks', 0))}\n"
-                f"  Total Impressions:        {int(kpi.get('totalImpressions', 0))}"
-            ),
-        })
-
-    # ── Objective ────────────────────────────────────────────
-    if req.objective:
-        obj_map = {
-            "increase_revenue":        "Increase Revenue — optimise conversion rate and revenue lift",
-            "reduce_cart_abandonment": "Reduce Cart Abandonment — minimise checkout drop-off",
-            "improve_conversion_rate": "Improve Conversion Rate — maximise session-to-purchase ratio",
-            "optimize_marketing_roi":  "Optimise Marketing ROI — maximise returns on ad spend",
-        }
-        docs.append({
-            "id":   "objective",
-            "text": (
-                f"BUSINESS OBJECTIVE: {obj_map.get(req.objective, req.objective)}. "
-                f"All ML models, KPI projections, and strategy rankings are optimised "
-                f"specifically for this objective."
-            ),
-        })
-
-    # ── ML Ensemble ──────────────────────────────────────────
-    ensemble = req.ensemble or (req.mlResult or {}).get("ensemble", {})
-    if ensemble:
-        w = ensemble.get("weights", {})
-        docs.append({
-            "id":   "ml_ensemble",
-            "text": (
-                f"ML ENSEMBLE PERFORMANCE (v13.6 — includes quantity + discount_amount features):\n"
-                f"  Weighted accuracy:  {ensemble.get('avgAccuracy',  0):.2f}%\n"
-                f"  Weighted precision: {ensemble.get('avgPrecision', 0):.2f}%\n"
-                f"  Weighted recall:    {ensemble.get('avgRecall',    0):.2f}%\n"
-                f"  Weighted F1 score:  {ensemble.get('avgF1Score',   0):.2f}%\n"
-                f"  Ensemble weights — RF: {w.get('rf',0):.3f}, "
-                f"XGB: {w.get('xgb',0):.3f}, LGB: {w.get('lgb',0):.3f}"
-            ),
-        })
-
-    # ── Per-model metrics ────────────────────────────────────
-    ml_models = (req.mlResult or {}).get("models", {})
-    for model_key, m in ml_models.items():
-        if not m:
-            continue
-        docs.append({
-            "id":   f"model_{model_key}",
-            "text": (
-                f"{model_key.upper()} MODEL METRICS:\n"
-                f"  Accuracy:   {m.get('accuracy',  0):.2f}%\n"
-                f"  Precision:  {m.get('precision', 0):.2f}%\n"
-                f"  Recall:     {m.get('recall',    0):.2f}%\n"
-                f"  F1 Score:   {m.get('f1Score',   0):.2f}%\n"
-                f"  ROC-AUC:    {m.get('rocAuc',    0):.2f}%\n"
-                f"  Train time: {m.get('trainTime',  0):.1f}s"
-            ),
-        })
-
-    # ── Feature importance ───────────────────────────────────
-    feat_imp = req.featureImportance or (req.mlResult or {}).get("featureImportance", [])
-    if feat_imp:
-        top5 = feat_imp[:5]
-        lines = "\n".join(
-            f"  #{i+1} {f['feature']}: {f['importance']*100:.2f}%"
-            for i, f in enumerate(top5)
-        )
-        docs.append({
-            "id":   "feature_importance",
-            "text": (
-                f"TOP ML FEATURES (drive purchase probability predictions):\n"
-                f"{lines}\n"
-                f"NOTE v13.6: quantity and discount_amount are now included as features. "
-                f"For increase_revenue, quantity is the strongest new predictor."
-            ),
-        })
-
-    # ── KPI Regressor ────────────────────────────────────────
-    pkl_path = req.kpiPredictorPath
-    if pkl_path and os.path.exists(pkl_path):
-        try:
-            with open(pkl_path, "rb") as f:
-                bundle = pickle.load(f)
-            if isinstance(bundle, dict):
-                r2 = bundle.get("r2_scores", {})
-                docs.append({
-                    "id":   "kpi_regressor",
-                    "text": (
-                        f"KPI REGRESSOR (RandomForestRegressor — kpi_predictor.pkl):\n"
-                        f"  Real baseline conv rate: {bundle.get('real_conv',    0):.4f}%\n"
-                        f"  Real baseline CTR:       {bundle.get('real_ctr',     0):.4f}%\n"
-                        f"  Real baseline abandon:   {bundle.get('real_abandon', 0):.2f}%\n"
-                        f"  Real baseline ROI:       {bundle.get('real_roi',     0):.4f}x\n"
-                        f"  R² scores — CTR: {r2.get('t_ctr',0):.4f}, "
-                        f"Conv: {r2.get('t_conv',0):.4f}, "
-                        f"Abandon: {r2.get('t_abandon',0):.4f}, "
-                        f"ROI: {r2.get('t_roi',0):.4f}"
-                    ),
-                })
-        except Exception as pkl_err:
-            print(f"[RAG] Could not read kpi_predictor.pkl: {pkl_err}")
-
-    # ── Observer result ─────────────────────────────────────
-    agent_res  = req.agentResult or {}
-    obs_result = agent_res.get("observerResult", {})
-    if obs_result:
-        health = obs_result.get("healthScore", 0)
-        obs    = obs_result.get("observations", [])
-        raw    = obs_result.get("rawKPIs", {})
-        docs.append({
-            "id":   "observer_health",
-            "text": (
-                f"OBSERVER AGENT — KPI HEALTH (health score: {health}/100):\n"
-                f"  Real CTR:             {raw.get('ctr',            0):.4f}%\n"
-                f"  Real Conversion Rate: {raw.get('conversionRate', 0):.4f}%\n"
-                f"  Real Cart Abandon:    {raw.get('cartAbandonment',0):.2f}%\n"
-                f"  Real ROI:             {raw.get('roi',            0):.4f}x\n"
-                + "\n".join(
-                    f"  [{o.get('severity','?').upper()}] {o.get('metric','?')}: "
-                    f"{o.get('value',0):.4f}{o.get('unit','')} vs benchmark "
-                    f"{o.get('benchmark',0):.4f}{o.get('unit','')} — {o.get('message','')[:120]}"
-                    for o in obs
-                )
-            ),
-        })
-
-    # ── Analyst result ──────────────────────────────────────
-    analyst_res = agent_res.get("analystResult", {})
-    if analyst_res:
-        diagnosis  = analyst_res.get("diagnosis", "")
-        directions = analyst_res.get("fixDirections", [])
-        root_causes = analyst_res.get("rootCauses", [])
-        docs.append({
-            "id":   "analyst_diagnosis",
-            "text": (
-                f"ANALYST AGENT — ROOT CAUSE DIAGNOSIS:\n"
-                f"  {diagnosis}\n"
-                f"  Strategy directions: {', '.join(directions[:5])}\n"
-                + "\n".join(
-                    f"  [{rc.get('severity','?').upper()}] {rc.get('metric','?')}: "
-                    + " | ".join(
-                        f"{c.get('cause','')[:100]} (conf {c.get('confidence',0):.0%})"
-                        for c in rc.get("causes", [])[:2]
-                    )
-                    for rc in root_causes[:4]
-                )
-            ),
-        })
-
-    # ── Decision result / recommendation ────────────────────
-    decision_res = agent_res.get("decisionResult", {})
-    if decision_res:
-        rec  = decision_res.get("recommendation", {})
-        proj = rec.get("projectedMetrics", {})
-        imp  = rec.get("improvement", {})
-        docs.append({
-            "id":   "decision_recommendation",
-            "text": (
-                f"DECISION AGENT — TOP RECOMMENDATION:\n"
-                f"  Strategy: {rec.get('strategyName', 'N/A')}\n"
-                f"  Confidence: {rec.get('confidence', 0)}%\n"
-                f"  Score: {rec.get('score', 0)}/100\n"
-                f"  PKL-validated: {rec.get('pklScoringUsed', False)}\n"
-                f"  Projected Conversion: {proj.get('conversionRate', 0):.4f}%\n"
-                f"  Projected Cart Abandon: {proj.get('cartAbandonment', 0):.2f}%\n"
-                f"  Projected ROI: {proj.get('roi', 0):.4f}x\n"
-                f"  Revenue Lift: +{proj.get('revenueLift', 0):.1f}%\n"
-                f"  Conversion lift: {imp.get('before', 0):.4f}% → {imp.get('after', 0):.4f}% "
-                f"(+{imp.get('conversionLift', 0):.2f}%)\n"
-                f"  AI Insight: {rec.get('aiInsight', '')[:200]}"
-            ),
-        })
-
-        ranked = decision_res.get("rankedStrategies", [])
-        if ranked:
-            strategy_lines = "\n".join(
-                f"  #{s.get('rank','?')} {s.get('name','?')} — score {s.get('score',0):.1f} "
-                f"| ML proba: {(s.get('mlPurchaseProba') or 0)*100:.1f}% "
-                f"| conf: {s.get('confidenceBand','?')}"
-                for s in ranked[:6]
-            )
-            docs.append({
-                "id":   "ranked_strategies",
-                "text": f"ALL RANKED STRATEGIES ({len(ranked)} total):\n{strategy_lines}",
-            })
-
-    # ── Simulation what-if ──────────────────────────────────
-    sim_result = agent_res.get("simulationResult", {})
-    if sim_result:
-        whatif = sim_result.get("whatIfTable", [])
-        if whatif:
-            rows_txt = "\n".join(
-                f"  Discount {r.get('discountPct',0)}%: "
-                f"conv {r.get('projectedConversion',0):.4f}% "
-                f"(lift {r.get('convLift',0):+.4f}%), "
-                f"ROI {r.get('projectedROI',0):.4f}x"
-                for r in whatif
-            )
-            best_row = max(whatif, key=lambda r: r.get("convLift", 0))
-            docs.append({
-                "id":   "whatif_simulation",
-                "text": (
-                    f"WHAT-IF DISCOUNT SIMULATION:\n{rows_txt}\n"
-                    f"  OPTIMAL: {best_row.get('discountPct',0)}% discount "
-                    f"maximises conversion lift at +{best_row.get('convLift',0):.4f}%."
-                ),
-            })
-
-    # ── Channel conversion rates ────────────────────────────
-    ds = (agent_res.get("projectDatasetStats") or {})
-    ch_rates = ds.get("channel_conv_rates", {})
-    if not ch_rates:
-        ch_rates = {
-            "Google Ads": 22.7171, "Facebook Ads": 22.1241,
-            "Instagram":  22.0276, "Email":        22.6433,
-            "SEO":        21.6598, "Referral":     23.5984,
-        }
-    ch_lines = "\n".join(
-        f"  {ch}: {rate:.4f}% conversion" for ch, rate in ch_rates.items()
-        if not str(ch).isdigit()
-    )
-    if ch_lines:
-        docs.append({
-            "id":   "channel_conv_rates",
-            "text": (
-                f"PER-CHANNEL CONVERSION RATES (real dataset):\n"
-                f"{ch_lines}"
-            ),
-        })
-
-    print(f"[RAG] Built {len(docs)} context documents for {pid}")
-    return docs

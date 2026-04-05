@@ -6,7 +6,16 @@ const Project    = require("../models/Project");
 const UserAction = require("../models/UserAction");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
-const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "../uploads");
+
+// FIX ENG-4: resolve UPLOADS_DIR to an absolute path at module load time.
+// This prevents path mismatch when the Node process CWD differs from __dirname.
+// Local dev: UPLOADS_DIR=./uploads (in backend/.env) → resolves relative to CWD.
+// Render:    set UPLOADS_DIR=/mnt/data/uploads in the dashboard (already absolute).
+const UPLOADS_DIR = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, "../uploads");
+
+console.log(`[ProjectController] UPLOADS_DIR resolved → ${UPLOADS_DIR}`);
 
 /* ════════════════════════════════════════════════════════════════
    Retry wrapper for Python microservice calls
@@ -66,7 +75,6 @@ const uploadDatasets = async (req, res) => {
       status: { $in: REUSABLE_STATUSES },
     }).sort({ createdAt: -1 });
 
-    // Dedup: only reuse when engineered files physically exist on disk
     const dedupValid =
       existing &&
       existing.engineeredFiles?.ecommerce &&
@@ -91,7 +99,6 @@ const uploadDatasets = async (req, res) => {
         cleanedFiles:    existing.cleanedFiles,
         engineeredFiles: existing.engineeredFiles,
         kpiSummary:      existing.kpiSummary,
-        // FIX B/C: carry forward real dataset stats so simulation uses real medians
         datasetStats:    existing.datasetStats || null,
         status:               "engineered",
         reusedsDatasets:      true,
@@ -170,7 +177,6 @@ const resumeProject = async (req, res) => {
 
     console.log(`[Resume] projectId=${projectId} | status=${project.status}`);
 
-    // Re-trigger feature engineering if stuck at 'cleaned'
     if (project.status === "cleaned") {
       console.log(`[Resume] ${projectId} stuck at 'cleaned' — re-triggering feature engineering.`);
       triggerFeatureEngineering(project).catch((err) =>
@@ -409,6 +415,7 @@ const triggerPythonCleaning = async (project) => {
       {
         projectId:       project.projectId,
         mongoId:         project._id.toString(),
+        // FIX ENG-4: always send the resolved absolute path
         uploadsDir:      UPLOADS_DIR,
         ecommerceFile:   project.files.ecommerce,
         marketingFile:   project.files.marketing,
@@ -430,24 +437,27 @@ const triggerPythonCleaning = async (project) => {
       const fresh = await Project.findById(project._id);
       await triggerFeatureEngineering(fresh);
     } else {
+      const errMsg = response.data?.message || "Cleaning failed.";
+      console.error(`[Python:clean] ❌ ${project.projectId}: ${errMsg}`);
       await Project.findByIdAndUpdate(project._id, {
         status:       "error",
-        errorMessage: response.data?.message || "Cleaning failed.",
+        errorMessage: errMsg,
       });
     }
   } catch (err) {
+    const errMsg = `Cleaning exception: ${err.message}`;
+    console.error(`[Python:clean] ❌ ${project.projectId}: ${errMsg}`);
     await Project.findByIdAndUpdate(project._id, {
       status:       "error",
-      errorMessage: `Cleaning exception: ${err.message}`,
+      errorMessage: errMsg,
     }).catch(() => {});
   }
 };
 
 /* ════════════════════════════════════════════════════════════════
    INTERNAL — Feature engineering
-   FIX B/C: Persists datasetStats (real feature medians + normalization
-   maxes) on the project document so the agent pipeline can build a
-   correct base feature vector instead of using hardcoded defaults.
+   FIX ENG-4: sends absolute UPLOADS_DIR path to Python.
+   FIX ENG-5: stores actual Python error message on failure.
 ════════════════════════════════════════════════════════════════ */
 const triggerFeatureEngineering = async (project) => {
   try {
@@ -461,6 +471,7 @@ const triggerFeatureEngineering = async (project) => {
       {
         projectId:       project.projectId,
         mongoId:         project._id.toString(),
+        // FIX ENG-4: always send the resolved absolute path
         uploadsDir:      UPLOADS_DIR,
         ecommerceFile:   project.cleanedFiles.ecommerce,
         marketingFile:   project.cleanedFiles.marketing,
@@ -481,11 +492,6 @@ const triggerFeatureEngineering = async (project) => {
         kpiSummary: response.data.kpiSummary,
       };
 
-      // FIX B/C: Persist datasetStats so the agent pipeline payload can include
-      // real feature medians and normalization maxes for simulation_agent.
-      // datasetStats contains per-feature {median, mean, std, max, min}
-      // plus _max_pages and _max_time for engagement_score normalization,
-      // plus channel_conv_rates and segment_conv/abandon_rates.
       if (
         response.data.datasetStats &&
         Object.keys(response.data.datasetStats).length > 0
@@ -494,8 +500,7 @@ const triggerFeatureEngineering = async (project) => {
         console.log(
           `[Python:engineer] datasetStats stored for ${project.projectId} | ` +
           `max_pages=${response.data.datasetStats._max_pages} | ` +
-          `max_time=${response.data.datasetStats._max_time} | ` +
-          `channel_rates=${JSON.stringify(response.data.datasetStats.channel_conv_rates)}`
+          `max_time=${response.data.datasetStats._max_time}`
         );
       } else {
         console.warn(
@@ -511,15 +516,21 @@ const triggerFeatureEngineering = async (project) => {
         `KPIs: ${JSON.stringify(response.data.kpiSummary)}`
       );
     } else {
+      // FIX ENG-5: capture the actual Python error message (includes traceback)
+      const errMsg = response.data?.message || "Feature engineering failed.";
+      console.error(`[Python:engineer] ❌ ${project.projectId}: ${errMsg.slice(0, 500)}`);
       await Project.findByIdAndUpdate(project._id, {
         status:       "error",
-        errorMessage: response.data?.message || "Feature engineering failed.",
+        // Store a concise version (first 400 chars) so it fits in the UI
+        errorMessage: errMsg.slice(0, 400),
       });
     }
   } catch (err) {
+    const errMsg = `Feature engineering exception: ${err.message}`;
+    console.error(`[Python:engineer] ❌ ${project.projectId}: ${errMsg}`);
     await Project.findByIdAndUpdate(project._id, {
       status:       "error",
-      errorMessage: `Feature engineering exception: ${err.message}`,
+      errorMessage: errMsg,
     }).catch(() => {});
   }
 };

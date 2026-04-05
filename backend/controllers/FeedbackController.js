@@ -7,7 +7,11 @@ const Project     = require("../models/Project");
 const MLResult    = require("../models/MlResult");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
-const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "../uploads");
+
+// FIX ENG-4: resolve UPLOADS_DIR to absolute path
+const UPLOADS_DIR = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, "../uploads");
 
 /* ════════════════════════════════════════════════════════════════
    POST /api/feedback/approve
@@ -153,16 +157,6 @@ const rejectStrategy = async (req, res) => {
 
 /* ════════════════════════════════════════════════════════════════
    POST /api/feedback/shap
-
-   FIX 1 — MODEL PATH SELECTION:
-     Picks the first model path that physically exists on disk
-     (XGB → RF → LGB), with a clear log for skipped models.
-     Previously always used xgboost even when missing after restart.
-
-   FIX 2 — DIRECTION WAS HARDCODED "positive":
-     _buildRealFallbackSHAP now sets direction:"unknown" for every
-     feature — importances are always positive magnitudes with no
-     directional information.  Matches Python-side FIX L.
 ════════════════════════════════════════════════════════════════ */
 const getSHAP = async (req, res) => {
   try {
@@ -186,9 +180,6 @@ const getSHAP = async (req, res) => {
     const strategy              = strategies[strategyIndex];
     const realFeatureImportance = mlResult.featureImportance || [];
 
-    // FIX 1: pick the first model path that physically exists on disk.
-    // XGBoost preferred (supports TreeExplainer, stored as (model, LabelEncoder) tuple
-    // which Python FIX K handles correctly).  Falls back to RF then LGB.
     const modelPaths       = mlResult.modelPaths || {};
     const MODEL_PREFERENCE = ["xgboost", "randomForest", "lightgbm"];
     let resolvedModelPath  = null;
@@ -211,7 +202,6 @@ const getSHAP = async (req, res) => {
       `modelKey=${resolvedModelKey || "NONE"} | path=${resolvedModelPath || "NONE"}`
     );
 
-    // Attempt real SHAP via Python only when a model file is available
     if (resolvedModelPath) {
       try {
         const response = await axios.post(
@@ -222,7 +212,7 @@ const getSHAP = async (req, res) => {
             ecommerceFile:     project.engineeredFiles.ecommerce,
             marketingFile:     project.engineeredFiles.marketing,
             advertisingFile:   project.engineeredFiles.advertising,
-            modelPath:         resolvedModelPath,  // FIX 1: verified path
+            modelPath:         resolvedModelPath,
             objective:         agentResult.objective,
             strategyName:      strategy?.name || "Top Strategy",
             featureImportance: realFeatureImportance,
@@ -258,12 +248,10 @@ const getSHAP = async (req, res) => {
     } else {
       console.warn(
         `[SHAP] No model file found on disk for projectId=${projectId}. ` +
-        `Checked: ${MODEL_PREFERENCE.map((k) => `${k}=${modelPaths[k] || "not set"}`).join(", ")}. ` +
         `Using feature importance fallback.`
       );
     }
 
-    // ── Node-side fallback ──
     if (realFeatureImportance.length === 0) {
       return res.status(200).json({
         message:         "SHAP unavailable — no feature importance stored. Retrain models first.",
@@ -275,12 +263,10 @@ const getSHAP = async (req, res) => {
       });
     }
 
-    // FIX 2: direction is "unknown" — importance magnitudes carry no sign
     const fallback = _buildRealFallbackSHAP(realFeatureImportance);
     const fallbackContext = resolvedModelPath
       ? `Feature importance shown (SHAP computation failed for ${resolvedModelKey} model). ` +
-        `Values show each feature's contribution magnitude but direction (positive/negative impact) ` +
-        `cannot be determined from tree importances alone. Re-train or check server logs.`
+        `Direction cannot be determined from tree importances alone. Re-train or check server logs.`
       : `Feature importance shown (no model file found on disk — server may have restarted). ` +
         `Direction cannot be determined from importances alone. Re-train to restore real SHAP.`;
 
@@ -323,26 +309,14 @@ const getFeedbackHistory = async (req, res) => {
 /* ════════════════════════════════════════════════════════════════
    INTERNAL HELPERS
 ════════════════════════════════════════════════════════════════ */
-
-/**
- * FIX 2: Build Node-side fallback SHAP using feature importances.
- *
- * BEFORE (wrong):  direction: "positive"  — hardcoded, wrong for ~50% of features
- * AFTER (correct): direction: "unknown"   — importances are unsigned magnitudes
- *
- * Matches Python-side FIX L so the UI gets a consistent signal regardless
- * of which side generated the fallback.
- */
 const _buildRealFallbackSHAP = (featureImportance) => {
   if (!featureImportance || featureImportance.length === 0) return [];
   const total = featureImportance.reduce((s, f) => s + (f.importance || 0), 0) || 1;
   return featureImportance.slice(0, 8).map((f) => ({
     feature:    f.feature,
     importance: round4(f.importance / total),
-    // shapValue is the importance magnitude (≥ 0).  It is NOT a signed SHAP
-    // value — direction cannot be inferred from tree importances alone.
     shapValue:  round4(f.importance / total),
-    direction:  "unknown",  // FIX 2: was "positive"
+    direction:  "unknown",
     description: _shapDescriptionUnknown(f.feature),
   }));
 };
@@ -365,10 +339,6 @@ const _buildFallbackContext = (features, strategyName, objective) => {
   return ctx;
 };
 
-/**
- * FIX 2: Descriptions used when direction is unknown (importance fallback).
- * Avoids claiming any directional effect that cannot be confirmed.
- */
 const _shapDescriptionUnknown = (feature) => {
   const map = {
     pages_viewed:      "Pages viewed — key driver of purchase probability (direction unknown from importance alone)",
