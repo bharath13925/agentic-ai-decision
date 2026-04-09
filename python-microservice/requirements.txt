@@ -1,12 +1,10 @@
 # ───────────── Core Backend ─────────────
-
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 python-dotenv
 
 # ───────────── Data & ML ─────────────
-
 pandas
 numpy
 scikit-learn
@@ -15,32 +13,25 @@ lightgbm
 shap
 
 # ───────────── Database ─────────────
-
 pymongo
 
 # ───────────── LLM / Agents ─────────────
-
 crewai
 litellm
-groq
 
-# ───────────── LangChain ─────────────
-
+# ───────────── LangChain (minimal stable) ─────────────
 langchain
-langchain-core
 langchain-community
+
+# ───────────── Groq Integration ─────────────
 langchain-groq
-langchain-huggingface 
 
 # ───────────── Vector Store ─────────────
-
 faiss-cpu
 
-# ───────────── Embeddings (Semantic RAG) ─────────────
-
+# ───────────── Embeddings ─────────────
 sentence-transformers
 
 # ───────────── HTTP ─────────────
-
 httpx
 requests
