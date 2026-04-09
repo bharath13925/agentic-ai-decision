@@ -1,32 +1,15 @@
 /**
- * UserDashboard.jsx — AgenticIQ v13.6.2
+ * UserDashboard.jsx — AgenticIQ v15.0
  *
- * CHANGES vs v13.4:
- *
- *  RAG Integration (Groq API):
- *   - Resume Project card REPLACED by inline RagChatCard (Project AI Assistant)
- *   - RagChatCard connects to FAISS + Groq API via /api/rag endpoints
- *   - LLM: Groq (llama-3.3-70b-versatile) — set GROQ_API_KEY in python-microservice/.env
- *   - Auto-loads agent pipeline context after connection
- *   - Supports project ID lookup, chat, refresh, and disconnect
- *
- *  Dataset Update — AI_DB88BC76 (25,000 sessions):
- *   FIX U  — CHANNEL_CONV_RATE updated with real AI_DB88BC76 values:
- *              Google Ads: 22.7171%  Facebook Ads: 22.1241%  Instagram: 22.0276%
- *              Email: 22.6433%  SEO: 21.6598%  Referral: 23.5984%
- *
- *   FIX V  — SEGMENT_CONV_AFFINITY / SEGMENT_ABANDON_AFFINITY from real
- *              user_type split in AI_DB88BC76:
- *              user_type=0 (New/AtRisk): conv_ratio=0.8258, abandon=1.0946
- *              user_type=1 (Returning/HV/All): conv_ratio=1.1418, abandon=0.9228
- *
- *  ML Pipeline (v13.6.2 backend):
- *   - quantity + discount_amount in ECO features (77% → 93-99% accuracy)
- *   - _SAFE_DEFAULTS updated with real medians
- *   - n_iter=30 for wider hyperparameter search
- *
- *  All v13.4 fixes retained (FIX W–FIX BB, Step3 live-preview indicators,
- *  strict single-fire guard, SHAP unknown direction badge, etc.)
+ * Aligned with backend v15.0 (app.py v15.0, crew_pipeline.py v3.1):
+ *  - All PKLs stored in MongoDB GridFS (not disk)
+ *  - KPI regressor bundle passed directly to simulation_agent (not path)
+ *  - crew_pipeline.run_crew_pipeline() used for agent orchestration
+ *  - LangChain LCEL + Groq RAG (rag.py v4.0)
+ *  - simulation_agent v8.0 ECO_FEATURES aligned (29 features)
+ *  - decision_agent v5.5 dataset_stats validation + FIX Y/Z
+ *  - observer_agent v3.4 dynamic CTR benchmark
+ *  - Immediate reuse response (HTTP 200 + complete) handled without polling delay
  */
 
 import React, { useEffect, useState, useRef, useCallback } from "react";
@@ -803,7 +786,7 @@ function Step3SimulationMode({ project, currentObjective, firebaseUser, onNext, 
                     ))}
                   </div>
                   <p className="text-[#9CA3AF] text-[9px] mt-3 font-mono">
-                    ⓘ Channel/segment affinities from real dataset (AI_DB88BC76) · Referral = best conv at 23.60%
+                    ⓘ Channel/segment affinities sourced from your uploaded dataset · Referral typically shows highest conversion rate
                   </p>
                 </GlassCard>
               </motion.div>
@@ -840,7 +823,7 @@ function Step3SimulationMode({ project, currentObjective, firebaseUser, onNext, 
                     <FiInfo size={12} className="text-[#7C5CFF] mt-0.5 shrink-0" />
                     <p className="text-[#9CA3AF] text-[10px] leading-relaxed">
                       Simulation Agent uses a <span className="text-[#7C5CFF] font-semibold">RandomForestRegressor (kpi_predictor.pkl)</span> trained
-                      on your real data with <span className="text-[#00E0FF] font-semibold">quantity + discount_amount</span> features (v13.6.2) — no formula fallback.
+                      on your real data using 29 ML features — PKLs stored in MongoDB GridFS (v15.0). KPI Regressor projects strategy outcomes.
                     </p>
                   </div>
                 </GlassCard>
@@ -921,6 +904,28 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.message);
+
+      // FIX: When models are reused (HTTP 200 with status "complete"),
+      // fetch the MLResult immediately and proceed to agent pipeline
+      // without polling — avoids 3s+ delay waiting on a "training" event
+      // that will never come.
+      if (res.status === 200 && data.status === "complete" && data.reusedModels) {
+        if (mlDoneRef.current) return;
+        mlDoneRef.current = true;
+        // Fetch the full MLResult doc from DB
+        const mlRes  = await fetch(`${API}/ml/result/${project.projectId}`);
+        const mlData = await mlRes.json();
+        if (mlData.mlResult?.status === "complete") {
+          setMlResult(mlData.mlResult);
+          startAgentPipeline(mlData.mlResult);
+        } else {
+          // Fallback to polling in case of timing edge-case
+          pollMLResult();
+        }
+        return;
+      }
+
+      // HTTP 202 — training started asynchronously, poll for completion
       pollMLResult();
     } catch (err) { setErrMsg(err.message); setPhase("error"); }
   };
@@ -2300,7 +2305,7 @@ export default function UserDashboard() {
           </div>
           <div className="flex items-center gap-3">
             <span className="hidden md:inline-flex items-center gap-1 text-[9px] font-mono px-2 py-1 rounded-full border border-[#7C5CFF]/25 bg-[#7C5CFF]/8 text-[#7C5CFF]">
-              v13.6.2 · ML Pipeline
+              v15.0 · GridFS + LangChain RAG
             </span>
             <span className="text-[#9CA3AF] text-sm hidden md:block">
               <span className="text-white/40">Hi, </span><span className="text-white font-semibold">{userName}</span>
@@ -2339,7 +2344,7 @@ export default function UserDashboard() {
                     transition={{ duration: 2, repeat: Infinity }}>AI-Powered</motion.span>
                   <span className="text-xs font-mono px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-[#9CA3AF]">5-Step Pipeline</span>
                   <span className="text-xs font-mono px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-[#9CA3AF]">PKL-Validated</span>
-                  <span className="text-xs font-mono px-2.5 py-1 rounded-full border border-[#00E0FF]/20 bg-[#00E0FF]/8 text-[#00E0FF]">v13.6.2 · RAG + KPI Regressor</span>
+                  <span className="text-xs font-mono px-2.5 py-1 rounded-full border border-[#00E0FF]/20 bg-[#00E0FF]/8 text-[#00E0FF]">v15.0 · GridFS + LangChain LCEL + Groq</span>
                 </div>
                 <h1 className="text-4xl md:text-5xl font-black text-white mb-2 leading-tight">
                   Welcome back,{" "}
@@ -2390,7 +2395,7 @@ export default function UserDashboard() {
               {/* Pipeline overview */}
               <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.28 }}>
                 <GlassCard className="p-6" accent={C.violet}>
-                  <p className="text-[#9CA3AF] text-[10px] font-mono uppercase tracking-widest mb-5">Pipeline Overview — v13.6.2</p>
+                  <p className="text-[#9CA3AF] text-[10px] font-mono uppercase tracking-widest mb-5">Pipeline Overview — v15.0</p>
                   <div className="flex items-stretch gap-0 flex-wrap md:flex-nowrap">
                     {[
                       { n: "01", label: "Upload",     desc: "3 CSV datasets",          color: C.violet, icon: FiUpload    },
@@ -2426,8 +2431,8 @@ export default function UserDashboard() {
                   <div className="mt-5 pt-4 border-t border-white/6">
                     <div className="flex flex-wrap gap-2">
                       {[
-                        { icon: FiShield,       label: "KPI regressor required (quantity + discount_amount features v13.6.2)", color: C.violet },
-                        { icon: FiDatabase,     label: "Real dataset (AI_DB88BC76): conv=22.46%, abandon=65.15%, ROI=5.00x",    color: C.cyan   },
+                        { icon: FiShield,       label: "KPI regressor required (29 features, GridFS PKL storage v15.0)", color: C.violet },
+                        { icon: FiDatabase,     label: "Real KPIs computed from your uploaded dataset (CTR, Conv Rate, Cart Abandon, ROI)",    color: C.cyan   },
                         { icon: FiMessageSquare,label: "FAISS + Ollama RAG — chat with your ML results via AI Assistant",       color: C.pink   },
                       ].map(({ icon: Icon, label, color }) => (
                         <div key={label} className="flex items-center gap-1.5 text-[10px] font-mono text-[#9CA3AF]">

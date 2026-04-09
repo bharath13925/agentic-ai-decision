@@ -10,7 +10,7 @@ const PYTHON_URL = process.env.PYTHON_URL || "http://localhost:8000";
 ════════════════════════════════════════════════════════════════ */
 const ragChat = async (req, res) => {
   try {
-    const { projectId, query,model = "qwen2.5:7b", topK = 4 } = req.body;
+    const { projectId, query, model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile", topK = 4 } = req.body;
 
     if (!projectId)
       return res.status(400).json({ message: "projectId is required." });

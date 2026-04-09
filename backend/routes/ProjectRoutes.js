@@ -18,6 +18,8 @@ const UPLOADS_DIR = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.join(__dirname, "../uploads");
 
+// FIX: cleanedDir was missing — Python microservice writes cleaned files here on first run.
+// Without pre-creating it, the Python side may fail if its own mkdir is not called first.
 const cleanedDir    = path.join(UPLOADS_DIR, "cleaned");
 const engineeredDir = path.join(UPLOADS_DIR, "engineered");
 const modelsDir     = path.join(UPLOADS_DIR, "models");

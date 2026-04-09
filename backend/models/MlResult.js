@@ -4,33 +4,72 @@ const mlResultSchema = new mongoose.Schema({
   projectId: { type: String, required: true, index: true },
   uid:       { type: String, required: true },
 
+  /*
+   * Per-model metrics — expanded to include all fields now returned by
+   * app.py v15.0.0: balancedAccuracy, rocAuc, f1Purchased added.
+   */
   models: {
     randomForest: {
-      accuracy: Number, precision: Number, recall: Number,
-      f1Score:  Number, trainTime: Number,
+      accuracy:         Number,
+      balancedAccuracy: Number,
+      precision:        Number,
+      recall:           Number,
+      f1Score:          Number,
+      f1Purchased:      Number,
+      rocAuc:           Number,
+      trainTime:        Number,
     },
     xgboost: {
-      accuracy: Number, precision: Number, recall: Number,
-      f1Score:  Number, trainTime: Number,
+      accuracy:         Number,
+      balancedAccuracy: Number,
+      precision:        Number,
+      recall:           Number,
+      f1Score:          Number,
+      f1Purchased:      Number,
+      rocAuc:           Number,
+      trainTime:        Number,
     },
     lightgbm: {
-      accuracy: Number, precision: Number, recall: Number,
-      f1Score:  Number, trainTime: Number,
+      accuracy:         Number,
+      balancedAccuracy: Number,
+      precision:        Number,
+      recall:           Number,
+      f1Score:          Number,
+      f1Purchased:      Number,
+      rocAuc:           Number,
+      trainTime:        Number,
     },
   },
 
+  /*
+   * Ensemble — expanded to include avgBalancedAccuracy and avgRocAuc
+   * returned by the ROC-AUC weighted ensemble in app.py v15.0.0.
+   */
   ensemble: {
-    avgAccuracy:  Number,
-    avgPrecision: Number,
-    avgRecall:    Number,
-    avgF1Score:   Number,
-    method:       { type: String, default: "weighted_average" },
-    weights:      { rf: Number, xgb: Number, lgb: Number },
+    avgAccuracy:         Number,
+    avgBalancedAccuracy: Number,
+    avgPrecision:        Number,
+    avgRecall:           Number,
+    avgF1Score:          Number,
+    avgRocAuc:           Number,
+    method:              { type: String, default: "roc_auc_weighted_average" },
+    weights:             { rf: Number, xgb: Number, lgb: Number },
   },
 
   avgPurchaseProbability: { type: Number, default: null },
   featureImportance:      [{ feature: String, importance: Number }],
 
+  /*
+   * modelPaths — MongoDB GridFS keys (ALWAYS, local and production).
+   * Format: "{projectId}/models/{model_name}.pkl"
+   * Examples:
+   *   "AI_AB12CD34/models/random_forest.pkl"
+   *   "AI_AB12CD34/models/xgboost.pkl"
+   *   "AI_AB12CD34/models/lightgbm.pkl"
+   *
+   * These are NOT disk paths. They are GridFS filenames stored in MongoDB.
+   * Python's gridfs_storage.load_pickle(key) retrieves them.
+   */
   modelPaths: {
     randomForest: String,
     xgboost:      String,
@@ -38,46 +77,45 @@ const mlResultSchema = new mongoose.Schema({
   },
 
   /*
-   * The objective this model was trained for.
-   * The agent pipeline checks this against the current objective and rejects
-   * mismatches — ensuring projections are always objective-consistent.
+   * storageBackend — always "gridfs" from v15.0.0 onwards.
+   * Kept for audit/debugging purposes.
+   */
+  storageBackend: {
+    type:    String,
+    enum:    ["disk", "gridfs"],
+    default: "gridfs",
+  },
+
+  /*
+   * trainedForObjective — the objective this model was trained for.
+   * Agent pipeline checks this to prevent objective mismatch.
    */
   trainedForObjective: { type: String, default: null },
 
   /*
-   * Tuned hyperparameters per model — stored for audit / reproducibility.
+   * datasetFingerprint — SHA-256 hash encoding dataset features + objective.
+   * Used for model reuse deduplication in MlController.
    */
-  bestHyperparams: { type: mongoose.Schema.Types.Mixed, default: null },
+  datasetFingerprint: { type: String, default: null },
 
   /*
-   * DATA-DRIVEN mechanism strengths derived from feature importance.
-   * Computed in train_models and passed to simulation_agent to weight
-   * each strategy's KPI impact multipliers.
-   * Replaces hardcoded MECHANISM_STRENGTH constants in simulation_agent.
+   * reusedFromProjectId — if models were reused from another project,
+   * this stores the source projectId.
    */
+  reusedFromProjectId: { type: String, default: null },
+
+  bestHyperparams:           { type: mongoose.Schema.Types.Mixed, default: null },
   learnedMechanismStrengths: { type: mongoose.Schema.Types.Mixed, default: null },
+  learnedObjectiveWeights:   { type: mongoose.Schema.Types.Mixed, default: null },
 
   /*
-   * DATA-DRIVEN objective weights derived from feature importance.
-   * Replaces hardcoded DEFAULT_OBJECTIVE_WEIGHTS in simulation_agent
-   * when available, making scoring reflect the actual dataset's signal.
-   */
-  learnedObjectiveWeights: { type: mongoose.Schema.Types.Mixed, default: null },
-
-  /*
-   * Path to the KPI regressor (RandomForestRegressor) pkl.
-   * REQUIRED for the simulation agent — pipeline refuses to run without it.
-   * Stores the full absolute path so file-existence checks work across restarts.
+   * kpiPredictorPath — MongoDB GridFS key for the KPI regressor bundle.
+   * Format: "{projectId}/models/kpi_predictor.pkl"
+   * Example: "AI_AB12CD34/models/kpi_predictor.pkl"
    */
   kpiPredictorPath: { type: String, default: null },
 
-  /*
-   * Pipeline version tag — set explicitly from the Python microservice response.
-   * DO NOT rely on this schema default for version tracking; the triggerMLTraining
-   * function overwrites it with d.pipelineVersion from app.py.
-   * Default here is a fallback for documents created before v13.4.
-   */
-  pipelineVersion: { type: String, default: "v13.4" },
+  pipelineVersion: { type: String, default: "v15.0.0" },
 
   status: {
     type:    String,
@@ -88,5 +126,6 @@ const mlResultSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 mlResultSchema.index({ projectId: 1, createdAt: -1 });
+mlResultSchema.index({ datasetFingerprint: 1, trainedForObjective: 1 });
 
 module.exports = mongoose.model("MLResult", mlResultSchema);

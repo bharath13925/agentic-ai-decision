@@ -8,22 +8,106 @@ const MLResult    = require("../models/MlResult");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
 
-// FIX ENG-4: resolve UPLOADS_DIR to absolute path
 const UPLOADS_DIR = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.join(__dirname, "../uploads");
 
-/* ════════════════════════════════════════════════════════════════
-   POST /api/feedback/approve
-════════════════════════════════════════════════════════════════ */
+const isValidGfsKey = (key) => {
+  return typeof key === "string" && key.length > 0 && key.includes("/models/");
+};
+
+const _deleteAllProjectCsvs = (project, projectId) => {
+  const filesToDelete = [];
+
+  if (project.files) {
+    const { ecommerce, marketing, advertising } = project.files;
+    if (ecommerce)   filesToDelete.push(path.join(UPLOADS_DIR, ecommerce));
+    if (marketing)   filesToDelete.push(path.join(UPLOADS_DIR, marketing));
+    if (advertising) filesToDelete.push(path.join(UPLOADS_DIR, advertising));
+  }
+  if (project.cleanedFiles) {
+    const { ecommerce, marketing, advertising } = project.cleanedFiles;
+    if (ecommerce)   filesToDelete.push(path.join(UPLOADS_DIR, ecommerce));
+    if (marketing)   filesToDelete.push(path.join(UPLOADS_DIR, marketing));
+    if (advertising) filesToDelete.push(path.join(UPLOADS_DIR, advertising));
+  }
+  if (project.engineeredFiles) {
+    const { ecommerce, marketing, advertising } = project.engineeredFiles;
+    if (ecommerce)   filesToDelete.push(path.join(UPLOADS_DIR, ecommerce));
+    if (marketing)   filesToDelete.push(path.join(UPLOADS_DIR, marketing));
+    if (advertising) filesToDelete.push(path.join(UPLOADS_DIR, advertising));
+  }
+
+  let deleted = 0;
+  let skipped = 0;
+  for (const filePath of filesToDelete) {
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+        deleted++;
+        console.log(`[CSV:cleanup] Deleted: ${filePath}`);
+      } catch (e) {
+        console.warn(`[CSV:cleanup] Could not delete ${filePath}: ${e.message}`);
+      }
+    } else {
+      skipped++;
+    }
+  }
+  console.log(
+    `[CSV:cleanup][post-shap] projectId=${projectId} | deleted=${deleted} | skipped=${skipped}`
+  );
+};
+
+const _triggerPostSHAPCleanup = async (project, projectId) => {
+  try {
+    const pyResp = await axios.post(
+      `${PYTHON_URL}/delete-project-csvs`,
+      {
+        projectId,
+        uploadsDir:      UPLOADS_DIR,
+        ecommerceFile:   project.engineeredFiles?.ecommerce   || null,
+        marketingFile:   project.engineeredFiles?.marketing   || null,
+        advertisingFile: project.engineeredFiles?.advertising || null,
+      },
+      { timeout: 15000 }
+    );
+    console.log(
+      `[CSV:cleanup][post-shap] Python side: ` +
+      `deleted=${JSON.stringify(pyResp.data?.deleted)} | ` +
+      `skipped=${JSON.stringify(pyResp.data?.skipped)}`
+    );
+  } catch (e) {
+    console.warn(
+      `[CSV:cleanup][post-shap] Python /delete-project-csvs failed (non-fatal): ${e.message}`
+    );
+  }
+
+  _deleteAllProjectCsvs(project, projectId);
+};
+
+const _cleanupTriggered = new Map(); 
+const _CLEANUP_TTL_MS   = 24 * 60 * 60 * 1000; 
+
+function _hasCleanupBeenTriggered(projectId) {
+  const ts = _cleanupTriggered.get(projectId);
+  if (!ts) return false;
+  if (Date.now() - ts > _CLEANUP_TTL_MS) {
+    _cleanupTriggered.delete(projectId);
+    return false;
+  }
+  return true;
+}
+
+function _markCleanupTriggered(projectId) {
+  _cleanupTriggered.set(projectId, Date.now());
+}
+
 const approveStrategy = async (req, res) => {
   try {
     const { uid, projectId, agentResultId, strategyIndex = 0, reason } = req.body;
 
     if (!uid || !projectId || !agentResultId)
       return res.status(400).json({ message: "uid, projectId, agentResultId required." });
-
-    console.log(`[Feedback:approve] projectId=${projectId} | strategyIndex=${strategyIndex}`);
 
     const agentResult = await AgentResult.findById(agentResultId);
     if (!agentResult)
@@ -62,7 +146,7 @@ const approveStrategy = async (req, res) => {
     });
 
     await Project.findOneAndUpdate({ projectId }, { status: "complete" });
-    console.log(`[Feedback:approve] ✅ projectId=${projectId} | Strategy: "${strategy.name}"`);
+    console.log(`[Feedback:approve]  projectId=${projectId} | Strategy: "${strategy.name}"`);
 
     return res.status(201).json({
       message:    "Strategy approved and stored. Project complete.",
@@ -75,17 +159,12 @@ const approveStrategy = async (req, res) => {
   }
 };
 
-/* ════════════════════════════════════════════════════════════════
-   POST /api/feedback/reject
-════════════════════════════════════════════════════════════════ */
 const rejectStrategy = async (req, res) => {
   try {
     const { uid, projectId, agentResultId, strategyIndex = 0, reason } = req.body;
 
     if (!uid || !projectId || !agentResultId)
       return res.status(400).json({ message: "uid, projectId, agentResultId required." });
-
-    console.log(`[Feedback:reject] projectId=${projectId} | strategyIndex=${strategyIndex}`);
 
     const agentResult = await AgentResult.findById(agentResultId);
     if (!agentResult)
@@ -128,10 +207,6 @@ const rejectStrategy = async (req, res) => {
       allStrategiesExhausted: exhausted,
     });
 
-    console.log(
-      `[Feedback:reject] projectId=${projectId} | "${strategy.name}" | Exhausted: ${exhausted}`
-    );
-
     if (exhausted) {
       return res.status(200).json({
         message:      "All strategies exhausted.",
@@ -155,9 +230,6 @@ const rejectStrategy = async (req, res) => {
   }
 };
 
-/* ════════════════════════════════════════════════════════════════
-   POST /api/feedback/shap
-════════════════════════════════════════════════════════════════ */
 const getSHAP = async (req, res) => {
   try {
     const { projectId, agentResultId, strategyIndex = 0 } = req.body;
@@ -186,21 +258,25 @@ const getSHAP = async (req, res) => {
     let resolvedModelKey   = null;
 
     for (const key of MODEL_PREFERENCE) {
-      const p = modelPaths[key];
-      if (p && fs.existsSync(p)) {
-        resolvedModelPath = p;
+      const gfsKey = modelPaths[key];
+      if (gfsKey && isValidGfsKey(gfsKey)) {
+        resolvedModelPath = gfsKey;
         resolvedModelKey  = key;
         break;
       }
-      if (p) {
-        console.warn(`[SHAP] ${key} model path missing on disk: ${p}`);
+      if (gfsKey) {
+        console.warn(`[SHAP] Invalid GridFS key for ${key}: "${gfsKey}"`);
       }
     }
 
     console.log(
       `[SHAP] projectId=${projectId} | strategyIndex=${strategyIndex} | ` +
-      `modelKey=${resolvedModelKey || "NONE"} | path=${resolvedModelPath || "NONE"}`
+      `modelKey=${resolvedModelKey || "NONE"} | GridFS key=${resolvedModelPath || "NONE"}`
     );
+
+    const ecommerceFile   = project.engineeredFiles?.ecommerce   || "";
+    const marketingFile   = project.engineeredFiles?.marketing   || "";
+    const advertisingFile = project.engineeredFiles?.advertising || "";
 
     if (resolvedModelPath) {
       try {
@@ -209,9 +285,9 @@ const getSHAP = async (req, res) => {
           {
             projectId,
             uploadsDir:        UPLOADS_DIR,
-            ecommerceFile:     project.engineeredFiles.ecommerce,
-            marketingFile:     project.engineeredFiles.marketing,
-            advertisingFile:   project.engineeredFiles.advertising,
+            ecommerceFile,
+            marketingFile,
+            advertisingFile,
             modelPath:         resolvedModelPath,
             objective:         agentResult.objective,
             strategyName:      strategy?.name || "Top Strategy",
@@ -222,9 +298,25 @@ const getSHAP = async (req, res) => {
 
         if (response.data?.status === "success") {
           console.log(
-            `[SHAP] ✅ Real SHAP computed | fallback=${response.data.fallback} | ` +
-            `sampleSize=${response.data.sampleSize} | model=${resolvedModelKey}`
+            `[SHAP] Computed | fallback=${response.data.fallback} | ` +
+            `sampleSize=${response.data.sampleSize} | model=${resolvedModelKey} | GridFS`
           );
+
+          // FIX: use TTL-aware Map instead of leaking Set
+          if (!_hasCleanupBeenTriggered(projectId)) {
+            _markCleanupTriggered(projectId);
+            console.log(
+              `[CSV:cleanup] First successful SHAP for ${projectId} — triggering post-SHAP cleanup`
+            );
+            _triggerPostSHAPCleanup(project, projectId).catch((e) =>
+              console.warn(`[CSV:cleanup] post-SHAP cleanup error (non-fatal): ${e.message}`)
+            );
+          } else {
+            console.log(
+              `[CSV:cleanup] Cleanup already triggered for ${projectId} — skipping duplicate`
+            );
+          }
+
           return res.status(200).json({
             message:         "SHAP computed.",
             shapValues:      response.data.shapValues,
@@ -241,14 +333,11 @@ const getSHAP = async (req, res) => {
           `[SHAP] Python returned non-success: ${JSON.stringify(response.data?.message)}`
         );
       } catch (shapErr) {
-        console.warn(
-          `[SHAP] Python /compute-shap failed — using Node-side fallback: ${shapErr.message}`
-        );
+        console.warn(`[SHAP] Python /compute-shap failed — using fallback: ${shapErr.message}`);
       }
     } else {
       console.warn(
-        `[SHAP] No model file found on disk for projectId=${projectId}. ` +
-        `Using feature importance fallback.`
+        `[SHAP] No valid GridFS key for projectId=${projectId}. Using feature importance fallback.`
       );
     }
 
@@ -265,18 +354,16 @@ const getSHAP = async (req, res) => {
 
     const fallback = _buildRealFallbackSHAP(realFeatureImportance);
     const fallbackContext = resolvedModelPath
-      ? `Feature importance shown (SHAP computation failed for ${resolvedModelKey} model). ` +
-        `Direction cannot be determined from tree importances alone. Re-train or check server logs.`
-      : `Feature importance shown (no model file found on disk — server may have restarted). ` +
-        `Direction cannot be determined from importances alone. Re-train to restore real SHAP.`;
+      ? `Feature importance shown (SHAP computation failed for ${resolvedModelKey} model from GridFS). ` +
+        `Direction cannot be determined from tree importances alone. Check server logs.`
+      : `Feature importance shown (no valid GridFS key found — please retrain models). ` +
+        `Direction cannot be determined from importances alone.`;
 
     return res.status(200).json({
       message:         "Feature importance from trained model (SHAP fallback).",
       shapValues:      fallback,
       topFeatures:     fallback.slice(0, 6),
-      strategyContext: _buildFallbackContext(
-        fallback, strategy?.name, agentResult.objective
-      ),
+      strategyContext: _buildFallbackContext(fallback, strategy?.name, agentResult.objective),
       fallback:        true,
       fallbackType:    "feature_importance",
       fallbackContext,
@@ -306,17 +393,14 @@ const getFeedbackHistory = async (req, res) => {
   }
 };
 
-/* ════════════════════════════════════════════════════════════════
-   INTERNAL HELPERS
-════════════════════════════════════════════════════════════════ */
 const _buildRealFallbackSHAP = (featureImportance) => {
   if (!featureImportance || featureImportance.length === 0) return [];
   const total = featureImportance.reduce((s, f) => s + (f.importance || 0), 0) || 1;
   return featureImportance.slice(0, 8).map((f) => ({
-    feature:    f.feature,
-    importance: round4(f.importance / total),
-    shapValue:  round4(f.importance / total),
-    direction:  "unknown",
+    feature:     f.feature,
+    importance:  round4(f.importance / total),
+    shapValue:   round4(f.importance / total),
+    direction:   "unknown",
     description: _shapDescriptionUnknown(f.feature),
   }));
 };
@@ -341,7 +425,7 @@ const _buildFallbackContext = (features, strategyName, objective) => {
 
 const _shapDescriptionUnknown = (feature) => {
   const map = {
-    pages_viewed:      "Pages viewed — key driver of purchase probability (direction unknown from importance alone)",
+    pages_viewed:      "Pages viewed — key driver of purchase probability",
     time_on_site_sec:  "Time on site — strongly associated with conversion",
     discount_percent:  "Discount percentage — influences purchase decisions",
     unit_price:        "Product price — affects purchase probability",
@@ -359,6 +443,11 @@ const _shapDescriptionUnknown = (feature) => {
     engagement_score:  "Combined engagement score — pages + time signal",
     discount_impact:   "Absolute discount value — margin/purchase trade-off",
     price_per_page:    "Price per page browsed — purchase journey friction",
+    added_to_cart:     "Added to cart — strongest non-leaky purchase intent signal",
+    quantity:          "Quantity — items in cart signal purchase commitment",
+    cart_engage:       "Cart engagement — cart intent combined with session depth",
+    cart_time_ratio:   "Cart time ratio — time invested by cart-adding visitors",
+    cart_pages_ratio:  "Cart pages ratio — browsing depth of cart-adding visitors",
   };
   return map[feature] || `${feature} — contributes to model prediction (direction unknown)`;
 };

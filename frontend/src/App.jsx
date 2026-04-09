@@ -7,7 +7,7 @@ import LandingPage from './pages/LandingPage';
 import UserSignupForm from './pages/UserSignupForm';
 import UserLoginForm from './pages/UserLoginForm';
 import UserDashboard from './pages/UserDashboard';
-import PrivacyPolicy from './pages/PrivacyPolicy';
+import PrivacyPolicy from './pages/Privacypolicy';
 import TermsConditions from './pages/TermsConditions';
 import Support from './pages/Support';
 

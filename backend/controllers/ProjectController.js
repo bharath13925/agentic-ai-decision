@@ -7,10 +7,7 @@ const UserAction = require("../models/UserAction");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
 
-// FIX ENG-4: resolve UPLOADS_DIR to an absolute path at module load time.
-// This prevents path mismatch when the Node process CWD differs from __dirname.
-// Local dev: UPLOADS_DIR=./uploads (in backend/.env) → resolves relative to CWD.
-// Render:    set UPLOADS_DIR=/mnt/data/uploads in the dashboard (already absolute).
+// Resolve UPLOADS_DIR to an absolute path at module load time.
 const UPLOADS_DIR = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.join(__dirname, "../uploads");
@@ -45,6 +42,20 @@ const hashFile = (filePath) =>
   });
 
 /* ════════════════════════════════════════════════════════════════
+   HELPER — safely delete a file if it exists (no-op otherwise)
+════════════════════════════════════════════════════════════════ */
+const safeDelete = (filePath) => {
+  if (filePath && fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+      console.log(`[File:delete] Removed: ${filePath}`);
+    } catch (e) {
+      console.warn(`[File:delete] Could not remove ${filePath}: ${e.message}`);
+    }
+  }
+};
+
+/* ════════════════════════════════════════════════════════════════
    POST /api/projects/upload
 ════════════════════════════════════════════════════════════════ */
 const uploadDatasets = async (req, res) => {
@@ -75,32 +86,42 @@ const uploadDatasets = async (req, res) => {
       status: { $in: REUSABLE_STATUSES },
     }).sort({ createdAt: -1 });
 
-    const dedupValid =
-      existing &&
+    const isPostTraining = existing &&
+      ["ml_complete", "complete"].includes(existing.status);
+
+    const isEngineeredOnDisk = existing &&
       existing.engineeredFiles?.ecommerce &&
-      existing.engineeredFiles?.marketing &&
-      existing.engineeredFiles?.advertising &&
-      fs.existsSync(path.join(UPLOADS_DIR, existing.engineeredFiles.ecommerce)) &&
-      fs.existsSync(path.join(UPLOADS_DIR, existing.engineeredFiles.marketing)) &&
-      fs.existsSync(path.join(UPLOADS_DIR, existing.engineeredFiles.advertising));
+      fs.existsSync(path.join(UPLOADS_DIR, existing.engineeredFiles.ecommerce));
+
+    const hasValidKpi = existing &&
+      existing.kpiSummary &&
+      existing.kpiSummary.avgConversionRate > 0;
+
+    const dedupValid = hasValidKpi && (isPostTraining || isEngineeredOnDisk);
 
     if (dedupValid) {
-      console.log(`[Upload] Dedup hit → reusing processed files from ${existing.projectId}`);
+      console.log(`[Upload] Dedup hit → reusing processed data from ${existing.projectId} (status: ${existing.status})`);
+
+      // Delete the newly uploaded raw files — we don't need them
+      safeDelete(ecoPath);
+      safeDelete(mktPath);
+      safeDelete(advPath);
 
       const project = await Project.create({
         uid,
         projectName,
-        files: {
-          ecommerce:   files.ecommerce[0].filename,
-          marketing:   files.marketing[0].filename,
-          advertising: files.advertising[0].filename,
+        files: existing.files || {
+          ecommerce:   null,
+          marketing:   null,
+          advertising: null,
         },
         fileHashes:      { ecommerce: hashEco, marketing: hashMkt, advertising: hashAdv },
-        cleanedFiles:    existing.cleanedFiles,
-        engineeredFiles: existing.engineeredFiles,
+        cleanedFiles:    existing.cleanedFiles    || null,
+        engineeredFiles: existing.engineeredFiles || null,
         kpiSummary:      existing.kpiSummary,
         datasetStats:    existing.datasetStats || null,
-        status:               "engineered",
+        status:               isPostTraining ? existing.status : "engineered",
+        // FIX: field name is reusedsDatasets on the model (preserved for DB compat)
         reusedsDatasets:      true,
         reusedFromProjectId:  existing.projectId,
       });
@@ -110,6 +131,7 @@ const uploadDatasets = async (req, res) => {
         projectId:      project.projectId,
         projectName:    project.projectName,
         status:         project.status,
+        // FIX: response key uses reusedDatasets (camelCase, no typo) for frontend
         reusedDatasets: true,
         kpiSummary:     project.kpiSummary,
         project: {
@@ -123,7 +145,8 @@ const uploadDatasets = async (req, res) => {
 
     if (existing && !dedupValid) {
       console.warn(
-        `[Upload] Dedup hit for ${existing.projectId} but engineered files missing on disk — ` +
+        `[Upload] Dedup hit for ${existing.projectId} but cannot reuse — ` +
+        `kpiValid=${hasValidKpi} postTraining=${isPostTraining} diskOk=${isEngineeredOnDisk} ` +
         `falling through to fresh processing.`
       );
     }
@@ -415,7 +438,6 @@ const triggerPythonCleaning = async (project) => {
       {
         projectId:       project.projectId,
         mongoId:         project._id.toString(),
-        // FIX ENG-4: always send the resolved absolute path
         uploadsDir:      UPLOADS_DIR,
         ecommerceFile:   project.files.ecommerce,
         marketingFile:   project.files.marketing,
@@ -434,6 +456,12 @@ const triggerPythonCleaning = async (project) => {
           advertising: response.data.cleanedFiles.advertising,
         },
       });
+
+      // Delete raw uploaded files now that cleaned versions exist
+      safeDelete(path.join(UPLOADS_DIR, project.files.ecommerce));
+      safeDelete(path.join(UPLOADS_DIR, project.files.marketing));
+      safeDelete(path.join(UPLOADS_DIR, project.files.advertising));
+
       const fresh = await Project.findById(project._id);
       await triggerFeatureEngineering(fresh);
     } else {
@@ -456,8 +484,6 @@ const triggerPythonCleaning = async (project) => {
 
 /* ════════════════════════════════════════════════════════════════
    INTERNAL — Feature engineering
-   FIX ENG-4: sends absolute UPLOADS_DIR path to Python.
-   FIX ENG-5: stores actual Python error message on failure.
 ════════════════════════════════════════════════════════════════ */
 const triggerFeatureEngineering = async (project) => {
   try {
@@ -471,7 +497,6 @@ const triggerFeatureEngineering = async (project) => {
       {
         projectId:       project.projectId,
         mongoId:         project._id.toString(),
-        // FIX ENG-4: always send the resolved absolute path
         uploadsDir:      UPLOADS_DIR,
         ecommerceFile:   project.cleanedFiles.ecommerce,
         marketingFile:   project.cleanedFiles.marketing,
@@ -511,17 +536,22 @@ const triggerFeatureEngineering = async (project) => {
 
       await Project.findByIdAndUpdate(project._id, updatePayload);
 
+      // Delete cleaned files now that engineered files exist.
+      if (project.cleanedFiles) {
+        safeDelete(path.join(UPLOADS_DIR, project.cleanedFiles.ecommerce || ""));
+        safeDelete(path.join(UPLOADS_DIR, project.cleanedFiles.marketing || ""));
+        safeDelete(path.join(UPLOADS_DIR, project.cleanedFiles.advertising || ""));
+      }
+
       console.log(
         `[Python:engineer] Done → ${project.projectId} | ` +
         `KPIs: ${JSON.stringify(response.data.kpiSummary)}`
       );
     } else {
-      // FIX ENG-5: capture the actual Python error message (includes traceback)
       const errMsg = response.data?.message || "Feature engineering failed.";
       console.error(`[Python:engineer] ❌ ${project.projectId}: ${errMsg.slice(0, 500)}`);
       await Project.findByIdAndUpdate(project._id, {
         status:       "error",
-        // Store a concise version (first 400 chars) so it fits in the UI
         errorMessage: errMsg.slice(0, 400),
       });
     }
@@ -539,9 +569,14 @@ const triggerFeatureEngineering = async (project) => {
    HELPERS
 ════════════════════════════════════════════════════════════════ */
 const getAllowedStep = (status, latestObjective, latestSimMode) => {
+  // FIX: "analyzing" status means ML training is running — user is on step 4,
+  // not step 1. Previously returned 1 for any non-engineered status.
+  const PRE_STEP2 = ["uploaded", "cleaning", "cleaned", "engineering", "error"];
+  if (PRE_STEP2.includes(status)) return 1;
   if (!["engineered", "analyzing", "ml_complete", "complete"].includes(status)) return 1;
   if (!latestObjective) return 2;
   if (!latestSimMode)   return 3;
+  if (["analyzing"].includes(status)) return 4;
   if (["ml_complete", "complete"].includes(status)) return 5;
   return 4;
 };

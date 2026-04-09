@@ -1,4 +1,5 @@
 const path        = require("path");
+const crypto      = require("crypto");
 const axios       = require("axios");
 const Project     = require("../models/Project");
 const MLResult    = require("../models/MlResult");
@@ -7,17 +8,106 @@ const UserAction  = require("../models/UserAction");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
 
-// FIX ENG-4: resolve UPLOADS_DIR to absolute path
 const UPLOADS_DIR = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.join(__dirname, "../uploads");
 
 console.log(`[MlController] UPLOADS_DIR resolved → ${UPLOADS_DIR}`);
+console.log(`[MlController] PKL storage → GridFS (always) | CSV cleanup → DEFERRED (after compute-shap)`);
 
-/* ════════════════════════════════════════════════════════════════
-   Retry wrapper for Python microservice calls
-════════════════════════════════════════════════════════════════ */
-async function callPythonWithRetry(url, data, retries = 2, timeout = 180000) {
+const computeDatasetFingerprint = (kpiSummary, objective, datasetStats) => {
+  const r = (v, d) => (typeof v === "number" ? +v.toFixed(d) : 0);
+
+  if (datasetStats && typeof datasetStats === "object") {
+    const med = (feat) => {
+      const s = datasetStats[feat];
+      if (s && typeof s === "object" && typeof s.median === "number") return r(s.median, 4);
+      return 0;
+    };
+
+    const parts = [
+      med("unit_price"),
+      med("discount_percent"),
+      med("pages_viewed"),
+      med("time_on_site_sec"),
+      med("engagement_score"),
+      med("discount_impact"),
+      med("price_per_page"),
+      med("user_type"),
+      r(kpiSummary.avgCTR,             4),
+      r(kpiSummary.avgConversionRate,  4),
+      r(kpiSummary.avgCartAbandonment, 4),
+      r(kpiSummary.avgROI,             4),
+      Math.round(kpiSummary.totalSessions || 0),
+      datasetStats.channel_conv_rates
+        ? Object.entries(datasetStats.channel_conv_rates)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([k, v]) => `${k}:${r(v, 4)}`)
+            .join(",")
+        : "no_ch",
+      objective || "unknown",
+    ].join("|");
+
+    return crypto.createHash("sha256").update(parts).digest("hex");
+  }
+
+  const parts = [
+    r(kpiSummary.avgCTR,             4),
+    r(kpiSummary.avgConversionRate,  4),
+    r(kpiSummary.avgCartAbandonment, 4),
+    r(kpiSummary.avgROI,             4),
+    Math.round(kpiSummary.totalSessions || 0),
+    objective || "unknown",
+  ].join("|");
+  return crypto.createHash("sha256").update(parts).digest("hex");
+};
+
+const findReusableMLResult = async (fingerprint, objective) => {
+  if (!fingerprint) return null;
+  const existing = await MLResult.findOne({
+    datasetFingerprint:        fingerprint,
+    trainedForObjective:       objective,
+    status:                    "complete",
+    kpiPredictorPath:          { $ne: null },
+    "modelPaths.randomForest": { $ne: null },
+    "modelPaths.xgboost":      { $ne: null },
+    "modelPaths.lightgbm":     { $ne: null },
+  }).sort({ createdAt: -1 });
+  return existing || null;
+};
+
+const findExistingCompleteMLResult = async (projectId, objective) => {
+  const ownResult = await MLResult.findOne({
+    projectId,
+    trainedForObjective: objective,
+    status:              "complete",
+    kpiPredictorPath:    { $ne: null },
+    "modelPaths.randomForest": { $ne: null },
+    "modelPaths.xgboost":      { $ne: null },
+    "modelPaths.lightgbm":     { $ne: null },
+  }).sort({ createdAt: -1 });
+
+  if (ownResult) return ownResult;
+  return null;
+};
+
+const findMLResultFromSourceProject = async (sourceProjectId, objective) => {
+  if (!sourceProjectId) return null;
+
+  const sourceResult = await MLResult.findOne({
+    projectId:           sourceProjectId,
+    trainedForObjective: objective,
+    status:              "complete",
+    kpiPredictorPath:    { $ne: null },
+    "modelPaths.randomForest": { $ne: null },
+    "modelPaths.xgboost":      { $ne: null },
+    "modelPaths.lightgbm":     { $ne: null },
+  }).sort({ createdAt: -1 });
+
+  return sourceResult || null;
+};
+
+async function callPythonWithRetry(url, data, retries = 2, timeout = 600000) {
   try {
     return await axios.post(url, data, { timeout });
   } catch (err) {
@@ -29,9 +119,6 @@ async function callPythonWithRetry(url, data, retries = 2, timeout = 180000) {
   }
 }
 
-/* ════════════════════════════════════════════════════════════════
-   HELPER — validate kpiSummary has real non-zero values
-════════════════════════════════════════════════════════════════ */
 const validateKpiSummary = (kpi, projectId) => {
   const issues = [];
   if (!kpi || typeof kpi !== "object")
@@ -47,11 +134,11 @@ const validateKpiSummary = (kpi, projectId) => {
     issues.push(`avgROI=${kpi.avgROI} (expected >0 from marketing CSV)`);
 
   if (issues.length > 0) {
-    console.warn(`[KPI Validation] ⚠️  ${projectId}: Zero/missing KPI values:`);
+    console.warn(`[KPI Validation]  ${projectId}: Zero/missing KPI values:`);
     issues.forEach((i) => console.warn(`  - ${i}`));
   } else {
     console.log(
-      `[KPI Validation] ✅ ${projectId}: Real KPIs confirmed — ` +
+      `[KPI Validation]  ${projectId}: Real KPIs confirmed — ` +
       `CTR=${kpi.avgCTR?.toFixed(4)}% | Conv=${kpi.avgConversionRate?.toFixed(4)}% | ` +
       `Abandon=${kpi.avgCartAbandonment?.toFixed(2)}% | ROI=${kpi.avgROI?.toFixed(4)}x`
     );
@@ -59,9 +146,11 @@ const validateKpiSummary = (kpi, projectId) => {
   return { valid: issues.length === 0, issues };
 };
 
-/* ════════════════════════════════════════════════════════════════
-   INTERNAL — Auto-store RAG context after pipeline completes
-════════════════════════════════════════════════════════════════ */
+const pklAccessible = (pathOrKey) => {
+  if (!pathOrKey) return false;
+  return typeof pathOrKey === "string" && pathOrKey.length > 0 && pathOrKey.includes("/models/");
+};
+
 const _autoStoreRagContext = async (projectId, agentResultDoc, kpiSummary, objective) => {
   try {
     console.log(`[RAG:autoStore] Storing context for projectId=${projectId}…`);
@@ -78,18 +167,18 @@ const _autoStoreRagContext = async (projectId, agentResultDoc, kpiSummary, objec
         kpiSummary,
         objective,
       },
-      { timeout: 60000 },
+      { timeout: 120000 },
     );
     if (response.data?.status === "success") {
       console.log(
-        `[RAG:autoStore] ✅ Stored ${response.data.stored?.length} docs | ` +
+        `[RAG:autoStore] Stored ${response.data.stored?.length} docs | ` +
         `FAISS vectors=${response.data.faiss_vectors}`
       );
     } else {
       console.warn(`[RAG:autoStore] Non-success: ${response.data?.message}`);
     }
   } catch (err) {
-    console.warn(`[RAG:autoStore] ⚠️  Failed (non-fatal): ${err.message}`);
+    console.warn(`[RAG:autoStore] Failed (non-fatal): ${err.message}`);
   }
 };
 
@@ -107,14 +196,178 @@ const trainModels = async (req, res) => {
     const project = await Project.findOne({ projectId });
     if (!project) return res.status(404).json({ message: "Project not found." });
 
-    if (!["engineered", "error", "analyzing", "ml_complete"].includes(project.status)) {
+    if (!["engineered", "error", "analyzing", "ml_complete", "complete"].includes(project.status)) {
       return res.status(400).json({
-        message: `Cannot train. Status is "${project.status}". Must be "engineered".`,
+        message: `Cannot train. Status is "${project.status}". Must be "engineered" or later.`,
       });
     }
+
+    const latestObjective = await UserAction
+      .findOne({ projectId, actionType: "objective_selected" })
+      .sort({ createdAt: -1 });
+    if (!latestObjective)
+      return res.status(400).json({ message: "No objective selected. Complete Step 2 first." });
+
+    const objective = latestObjective.objective;
+
+    // ── STEP 1: Check if THIS project already has a complete MLResult ──
+    const ownComplete = await findExistingCompleteMLResult(projectId, objective);
+    if (ownComplete) {
+      console.log(
+        `[ML:train] ✅ OWN COMPLETE — projectId=${projectId} already has trained models ` +
+        `for objective="${objective}" | accuracy=${ownComplete.ensemble?.avgAccuracy}% | ` +
+        `id=${ownComplete._id}`
+      );
+      await Project.findByIdAndUpdate(project._id, { status: "ml_complete", errorMessage: null });
+      return res.status(200).json({
+        message:           `Models already trained for objective "${objective}". Skipping retraining.`,
+        projectId,
+        mlResultId:        ownComplete._id,
+        status:            "complete",
+        reusedModels:      true,
+        reusedFromProject: projectId,
+        objective,
+        ensemble:          ownComplete.ensemble,
+        featureImportance: ownComplete.featureImportance,
+      });
+    }
+
+    // ── STEP 2: If datasets were reused, check source project's MLResult ──
+    if (project.reusedsDatasets && project.reusedFromProjectId) {
+      const sourceResult = await findMLResultFromSourceProject(
+        project.reusedFromProjectId, objective
+      );
+      if (sourceResult) {
+        console.log(
+          `[ML:train] ✅ SOURCE PROJECT REUSE — datasets came from ${project.reusedFromProjectId} ` +
+          `which has trained models for objective="${objective}" | ` +
+          `accuracy=${sourceResult.ensemble?.avgAccuracy}%`
+        );
+
+        await MLResult.deleteMany({ projectId });
+        const reusedMlResult = await MLResult.create({
+          projectId,
+          uid,
+          status:                    "complete",
+          trainedForObjective:       objective,
+          datasetFingerprint:        sourceResult.datasetFingerprint,
+          reusedFromProjectId:       sourceResult.projectId,
+          models:                    sourceResult.models,
+          ensemble:                  sourceResult.ensemble,
+          featureImportance:         sourceResult.featureImportance,
+          modelPaths:                sourceResult.modelPaths,
+          kpiPredictorPath:          sourceResult.kpiPredictorPath,
+          avgPurchaseProbability:    sourceResult.avgPurchaseProbability,
+          bestHyperparams:           sourceResult.bestHyperparams,
+          learnedMechanismStrengths: sourceResult.learnedMechanismStrengths,
+          learnedObjectiveWeights:   sourceResult.learnedObjectiveWeights,
+          storageBackend:            "gridfs",
+          pipelineVersion:           sourceResult.pipelineVersion,
+        });
+
+        await Project.findByIdAndUpdate(project._id, { status: "ml_complete", errorMessage: null });
+
+        return res.status(200).json({
+          message:           `Models reused from source project (same dataset, objective="${objective}"). Skipped retraining.`,
+          projectId,
+          mlResultId:        reusedMlResult._id,
+          status:            "complete",
+          reusedModels:      true,
+          reusedFromProject: sourceResult.projectId,
+          objective,
+          ensemble:          sourceResult.ensemble,
+          featureImportance: sourceResult.featureImportance,
+        });
+      }
+      console.log(
+        `[ML:train] Source project ${project.reusedFromProjectId} has no MLResult ` +
+        `for objective="${objective}" — checking fingerprint reuse or retraining`
+      );
+    }
+
+    // ── STEP 3: Fingerprint-based dedup across all projects ──
+    const statsSource = project.datasetStats ||
+      (project.reusedsDatasets && project.reusedFromProjectId
+        ? (await Project.findOne({ projectId: project.reusedFromProjectId }))?.datasetStats
+        : null);
+
+    const fingerprint = computeDatasetFingerprint(
+      project.kpiSummary   || {},
+      objective,
+      statsSource || null,
+    );
+    console.log(
+      `[ML:train] Dataset fingerprint: ${fingerprint.slice(0, 16)}… | objective: ${objective} | ` +
+      `source: ${statsSource ? "feature-medians+KPI" : "KPI-summary-only"}`
+    );
+
+    const reusable = await findReusableMLResult(fingerprint, objective);
+
+    if (reusable && reusable.projectId !== projectId) {
+      if (reusable.trainedForObjective !== objective) {
+        console.warn(
+          `[ML:train] ⚠️  Fingerprint match found (${reusable.projectId}) but ` +
+          `trainedForObjective mismatch: stored="${reusable.trainedForObjective}" ` +
+          `current="${objective}" — forcing full retrain`
+        );
+        // Fall through to full training below
+      } else {
+        console.log(
+          `[ML:train] ✅ FINGERPRINT REUSE — same dataset + same objective "${objective}" → ` +
+          `reusing models from ${reusable.projectId} ` +
+          `(trained ${new Date(reusable.createdAt).toLocaleDateString()}) | ` +
+          `accuracy=${reusable.ensemble?.avgAccuracy}%`
+        );
+
+        await MLResult.deleteMany({ projectId });
+        const reusedMlResult = await MLResult.create({
+          projectId,
+          uid,
+          status:                    "complete",
+          trainedForObjective:       objective,
+          datasetFingerprint:        fingerprint,
+          reusedFromProjectId:       reusable.projectId,
+          models:                    reusable.models,
+          ensemble:                  reusable.ensemble,
+          featureImportance:         reusable.featureImportance,
+          modelPaths:                reusable.modelPaths,
+          kpiPredictorPath:          reusable.kpiPredictorPath,
+          avgPurchaseProbability:    reusable.avgPurchaseProbability,
+          bestHyperparams:           reusable.bestHyperparams,
+          learnedMechanismStrengths: reusable.learnedMechanismStrengths,
+          learnedObjectiveWeights:   reusable.learnedObjectiveWeights,
+          storageBackend:            "gridfs",
+          pipelineVersion:           reusable.pipelineVersion,
+        });
+
+        await Project.findByIdAndUpdate(project._id, { status: "ml_complete", errorMessage: null });
+
+        return res.status(200).json({
+          message:           `Models reused (same dataset + same objective "${objective}"). Skipped retraining.`,
+          projectId,
+          mlResultId:        reusedMlResult._id,
+          status:            "complete",
+          reusedModels:      true,
+          reusedFromProject: reusable.projectId,
+          objective,
+          ensemble:          reusable.ensemble,
+          featureImportance: reusable.featureImportance,
+        });
+      }
+    }
+
+    if (reusable && reusable.projectId === projectId) {
+      console.log(
+        `[ML:train] Fingerprint matches self (same project retrain for objective="${objective}") — ` +
+        `proceeding with full training.`
+      );
+    }
+
+    // ── STEP 4: NO MATCH — run full training ──
     if (!project.engineeredFiles?.ecommerce) {
       return res.status(400).json({
-        message: "Engineered files not found. Please re-run feature engineering.",
+        message: "Engineered files not found. Please re-upload your datasets.",
+        requiresReupload: true,
       });
     }
 
@@ -131,41 +384,41 @@ const trainModels = async (req, res) => {
     ].filter(Boolean);
 
     if (missingDisk.length > 0) {
-      console.error(
-        `[ML:train] ❌ Engineered files missing on disk for ${projectId}: ${missingDisk.join(", ")}`
-      );
+      console.error(`[ML:train] ❌ Engineered CSVs missing for ${projectId}: ${missingDisk.join(", ")}`);
       return res.status(400).json({
         message:
-          "Engineered files are missing on disk (likely from a previous session or server restart). " +
-          "Please re-upload your datasets to regenerate them. Missing: " + missingDisk.join(", "),
+          "Engineered CSV files are missing on disk (server restart or re-upload needed). " +
+          "Missing: " + missingDisk.join(", "),
         requiresReupload: true,
         missingFiles:     missingDisk,
       });
     }
 
-    const latestObjective = await UserAction
-      .findOne({ projectId, actionType: "objective_selected" })
-      .sort({ createdAt: -1 });
-    if (!latestObjective)
-      return res.status(400).json({ message: "No objective selected. Complete Step 2 first." });
-
     await Project.findByIdAndUpdate(project._id, { status: "engineered", errorMessage: null });
     await MLResult.deleteMany({ projectId });
-    const mlResult = await MLResult.create({ projectId, uid, status: "training" });
+    const mlResult = await MLResult.create({
+      projectId,
+      uid,
+      status:             "training",
+      datasetFingerprint: fingerprint,
+    });
     await Project.findByIdAndUpdate(project._id, { status: "analyzing" });
 
     console.log(
-      `[ML:train] Started → projectId=${projectId} | objective=${latestObjective.objective}`
+      `[ML:train] Starting full training → projectId=${projectId} | objective=${objective} | ` +
+      `PKL→GridFS | CSV cleanup→DEFERRED (after compute-shap)`
     );
 
     res.status(202).json({
-      message:    "ML training started.",
+      message:      "ML training started.",
       projectId,
-      mlResultId: mlResult._id,
-      status:     "training",
+      mlResultId:   mlResult._id,
+      status:       "training",
+      reusedModels: false,
+      objective,
     });
 
-    triggerMLTraining(project, mlResult, latestObjective.objective).catch((err) =>
+    triggerMLTraining(project, mlResult, objective).catch((err) =>
       console.error(`[ML:train] ${projectId} — ${err.message}`)
     );
   } catch (err) {
@@ -225,14 +478,14 @@ const runAgentPipeline = async (req, res) => {
 
     if (!mlResult.kpiPredictorPath) {
       return res.status(400).json({
-        message:        "KPI regressor (.pkl) not found. The model was trained before v12. Please retrain.",
+        message:        "KPI regressor (.pkl) key not found. The model was trained before v15. Please retrain.",
         requiresRetrain: true,
       });
     }
 
-    if (!require("fs").existsSync(mlResult.kpiPredictorPath)) {
+    if (!pklAccessible(mlResult.kpiPredictorPath)) {
       return res.status(400).json({
-        message:        `KPI regressor file missing at: ${mlResult.kpiPredictorPath}. Please retrain.`,
+        message: `KPI regressor GridFS key is invalid: "${mlResult.kpiPredictorPath}". Please retrain.`,
         requiresRetrain: true,
       });
     }
@@ -250,13 +503,15 @@ const runAgentPipeline = async (req, res) => {
     const modelPaths = mlResult.modelPaths || {};
     const pklStatus  = {};
     for (const [key, p] of Object.entries(modelPaths)) {
-      const exists   = p && require("fs").existsSync(p);
-      pklStatus[key] = exists;
-      if (!exists) console.warn(`[AgentPipeline] ⚠️  PKL file missing: ${key} → ${p}`);
+      const accessible = pklAccessible(p);
+      pklStatus[key]   = accessible;
+      if (!accessible) {
+        console.warn(`[AgentPipeline] ⚠️  GridFS key invalid: ${key} → "${p}"`);
+      }
     }
     const pklAvailable = Object.values(pklStatus).some(Boolean);
     console.log(
-      `[AgentPipeline] PKL files: ${JSON.stringify(pklStatus)} | available=${pklAvailable}`
+      `[AgentPipeline] PKL GridFS keys status: ${JSON.stringify(pklStatus)} | available=${pklAvailable}`
     );
 
     const [latestObjective, latestSimMode] = await Promise.all([
@@ -282,7 +537,6 @@ const runAgentPipeline = async (req, res) => {
         currentObjective: currentObj,
       });
     }
-    console.log(`[AgentPipeline] ✅ Objective match: "${currentObj}"`);
 
     await AgentResult.deleteMany({ projectId });
     const agentResult = await AgentResult.create({
@@ -357,18 +611,24 @@ const triggerAgentPipeline = async (
       rf: 0.333, xgb: 0.333, lgb: 0.334,
     };
 
-    const datasetStats = project.datasetStats || null;
-    if (datasetStats) {
-      const maxPages = datasetStats._max_pages || "not stored";
-      const maxTime  = datasetStats._max_time  || "not stored";
-      console.log(
-        `[AgentPipeline] datasetStats present — max_pages=${maxPages}, max_time=${maxTime}`
-      );
-    } else {
-      console.warn(
-        `[AgentPipeline] ⚠️  datasetStats missing for ${project.projectId}. ` +
-        `Simulation agent will fall back to _SAFE_DEFAULTS. Re-run feature engineering to fix.`
-      );
+    let datasetStats = project.datasetStats || null;
+    if (!datasetStats && project.reusedsDatasets && project.reusedFromProjectId) {
+      const sourceProject = await Project.findOne({ projectId: project.reusedFromProjectId });
+      datasetStats = sourceProject?.datasetStats || null;
+      if (datasetStats) {
+        console.log(`[AgentPipeline] Using datasetStats from source project ${project.reusedFromProjectId}`);
+      }
+    }
+
+    const fsLib   = require("fs");
+    const pathLib = require("path");
+    let ecommerceEngineerFile = project.engineeredFiles?.ecommerce || null;
+    if (ecommerceEngineerFile) {
+      const fullPath = pathLib.join(UPLOADS_DIR, ecommerceEngineerFile);
+      if (!fsLib.existsSync(fullPath)) {
+        console.log(`[AgentPipeline] Engineered CSV not on disk (already cleaned) — PKL scoring will use datasetStats medians`);
+        ecommerceEngineerFile = null;
+      }
     }
 
     const payload = {
@@ -385,24 +645,21 @@ const triggerAgentPipeline = async (
       ensembleWeights,
       learnedMechanismStrengths: mlResult.learnedMechanismStrengths ?? null,
       learnedObjectiveWeights:   mlResult.learnedObjectiveWeights   ?? null,
-      // FIX ENG-4: always send resolved absolute path
-      uploadsDir:            UPLOADS_DIR,
-      ecommerceEngineerFile: project.engineeredFiles?.ecommerce || null,
-      featureImportance:     mlResult.featureImportance  ?? [],
-      kpiPredictorPath:      mlResult.kpiPredictorPath   ?? null,
-      datasetStats:          datasetStats,
+      uploadsDir:                UPLOADS_DIR,
+      ecommerceEngineerFile,
+      featureImportance:         mlResult.featureImportance  ?? [],
+      kpiPredictorPath:          mlResult.kpiPredictorPath   ?? null,
+      datasetStats:              datasetStats,
     };
 
     const response = await callPythonWithRetry(
-      `${PYTHON_URL}/run-agent-pipeline`, payload, 2, 180000
+      `${PYTHON_URL}/run-agent-pipeline`, payload, 2, 600000
     );
 
     if (response.data?.status === "success") {
       const d           = response.data;
       const topStrategy = d.decisionResult?.recommendation?.strategyName;
       const confidence  = d.decisionResult?.recommendation?.confidence;
-      const mlDriven    = d.simulationResult?.mlDriven;
-
       const realKPIs    = d.decisionResult?.realDatasetKPIs || {};
       const projMetrics = d.decisionResult?.recommendation?.projectedMetrics || {};
       const bestStrat   = d.decisionResult?.rankedStrategies?.[0] || {};
@@ -434,11 +691,7 @@ const triggerAgentPipeline = async (
         },
       });
 
-      console.log(`[AgentPipeline] ✅ Done → ${project.projectId}`);
-      console.log(
-        `[AgentPipeline] Top: "${topStrategy}" | Confidence: ${confidence}% | ` +
-        `ML-driven: ${mlDriven}`
-      );
+      console.log(`[AgentPipeline] ✅ Done → ${project.projectId} | Top: "${topStrategy}"`);
 
       const updatedAgentResult = await AgentResult.findById(agentResult._id);
       if (updatedAgentResult) {
@@ -468,10 +721,15 @@ const triggerAgentPipeline = async (
 
 /* ════════════════════════════════════════════════════════════════
    INTERNAL — ML Training trigger
+   FIX: callPythonWithRetry was called as (url, data, 6000000) — the 3rd arg
+   is `retries` not `timeout`. Fixed to (url, data, 2, 600000).
 ════════════════════════════════════════════════════════════════ */
 const triggerMLTraining = async (project, mlResult, objective) => {
   try {
-    console.log(`[ML:train] Starting → ${project.projectId} | Objective: ${objective}`);
+    console.log(
+      `[ML:train] Starting → ${project.projectId} | Objective: ${objective} | ` +
+      `PKL→GridFS | CSV cleanup→DEFERRED (after compute-shap)`
+    );
 
     const fsLib   = require("fs");
     const pathLib = require("path");
@@ -487,8 +745,8 @@ const triggerMLTraining = async (project, mlResult, objective) => {
 
     if (missingFiles.length > 0) {
       const errMsg =
-        "Engineered files missing on disk (likely from a previous session or machine restart). " +
-        "Please re-upload your datasets. Missing: " + missingFiles.join(", ");
+        "Engineered files missing on disk. Please re-upload your datasets. " +
+        "Missing: " + missingFiles.join(", ");
       console.error(`[ML:train] ❌ ${project.projectId}: ${errMsg}`);
       await MLResult.findByIdAndUpdate(mlResult._id, { status: "error", errorMessage: errMsg });
       await Project.findOneAndUpdate(
@@ -498,15 +756,14 @@ const triggerMLTraining = async (project, mlResult, objective) => {
       return;
     }
 
-    console.log(`[ML:train] ✅ Engineered files verified on disk → ${project.projectId}`);
-
+    // FIX: was callPythonWithRetry(url, data, 6000000) — 3rd arg is retries not timeout.
+    // Correct call: (url, data, retries=2, timeout=600000)
     const response = await callPythonWithRetry(
       `${PYTHON_URL}/train-models`,
       {
         projectId:       project.projectId,
         mongoId:         project._id.toString(),
         mlResultId:      mlResult._id.toString(),
-        // FIX ENG-4: always send resolved absolute path
         uploadsDir:      UPLOADS_DIR,
         ecommerceFile:   project.engineeredFiles.ecommerce,
         marketingFile:   project.engineeredFiles.marketing,
@@ -523,6 +780,7 @@ const triggerMLTraining = async (project, mlResult, objective) => {
       await MLResult.findByIdAndUpdate(mlResult._id, {
         status:                    "complete",
         trainedForObjective:       objective,
+        datasetFingerprint:        mlResult.datasetFingerprint,
         models:                    d.models,
         ensemble:                  d.ensemble,
         featureImportance:         d.featureImportance,
@@ -532,7 +790,8 @@ const triggerMLTraining = async (project, mlResult, objective) => {
         learnedMechanismStrengths: d.learnedMechanismStrengths ?? null,
         learnedObjectiveWeights:   d.learnedObjectiveWeights   ?? null,
         kpiPredictorPath:          d.kpiPredictorPath ?? null,
-        pipelineVersion:           d.pipelineVersion  ?? "v13.6.3",
+        storageBackend:            "gridfs",
+        pipelineVersion:           d.pipelineVersion  ?? "v15.0.0",
       });
 
       await Project.findOneAndUpdate(
@@ -543,7 +802,9 @@ const triggerMLTraining = async (project, mlResult, objective) => {
 
       console.log(
         `[ML:train] ✅ Done → ${project.projectId} | ` +
-        `Ensemble=${d.ensemble.avgAccuracy}%`
+        `Ensemble=${d.ensemble.avgAccuracy}% | PKL→GridFS | objective=${objective} | ` +
+        `fingerprint=${mlResult.datasetFingerprint?.slice(0, 12)}… | ` +
+        `CSVs retained on disk (will be deleted after compute-shap)`
       );
     } else {
       const errMsg = response.data?.message || "Training failed.";

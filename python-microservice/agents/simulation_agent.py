@@ -1,32 +1,40 @@
 """
-AgenticIQ — Simulation Agent v7.7
+AgenticIQ — Simulation Agent v8.0
 
-FIXES from v7.6:
+FIXES from v7.8:
 
-  FIX REGRESSOR-A — _ml_project_kpis LOADS NORMALISATION CONSTANTS FROM PKL:
-    The KPI regressor now stores di_99 and ppp_99 normalisation constants inside
-    the .pkl bundle (written by the new _train_kpi_regressor in app.py v13.5).
-    _ml_project_kpis reads these constants and applies them when building the
-    prediction vector, so that the features passed at inference exactly match
-    the scale used during training.
+  FIX FEAT-A — ECO_FEATURES LIST ALIGNED WITH app.py v15.0.0:
+    The previous ECO_FEATURES list had old features (quantity, discount_amount,
+    rating) that app.py v15.0.0 drops during training (ECO_DROP_COLUMNS) and
+    was missing the new interaction features added in v15:
+      added_to_cart, time_per_page, cart_engage, cart_time_ratio,
+      cart_pages_ratio, is_weekend, ch_x_user, season_x_cat, price_x_disc.
+    This misalignment caused feature vector dimension mismatches when scoring
+    strategies with PKL models, leading to silent wrong predictions.
+    Fixed: ECO_FEATURES now exactly mirrors ECO_RAW_FEATURES + ECO_DERIVED_FEATURES
+    from app.py v15.0.0.
 
-  FIX REGRESSOR-B — _build_base_vector USES NORMALISED DERIVED FEATURES:
-    The base vector for discount_impact and price_per_page is now computed as
-    a normalised float (0–1) matching the training scale, not the raw value.
+  FIX FEAT-B — _SAFE_DEFAULTS EXTENDED FOR ALL NEW FEATURES:
+    _SAFE_DEFAULTS was missing entries for all new interaction features.
+    When _build_base_vector or _apply_strategy_modifications looked up a
+    missing key it silently got 0.0 for all new features, producing a
+    systematically wrong base vector.
+    Fixed: all 11 interaction features now have correct real-median defaults.
 
-  FIX REGRESSOR-C — _apply_strategy_modifications USES NORMALISED SCALE:
-    All strategy modifications for discount_impact and price_per_page are written
-    as normalised values (disc*price / di_99, price/pages / ppp_99) so the model
-    receives the same feature distribution as training.
+  FIX FEAT-C (v8.0 REVERTED) — quantity / discount_amount / rating RESTORED:
+    app.py v15.0 trains WITH quantity, discount_amount, rating in ECO_RAW_FEATURES.
+    These are included in the PKL feature_cols. simulation_agent must include
+    them in ECO_RAW_FEATURES and _SAFE_DEFAULTS so dimension matches the PKL.
+    The PKL bundle feature_cols is always authoritative for scoring matrix shape.
 
-  FIX REGRESSOR-D — SAFE_DEFAULTS UPDATED:
-    All hardcoded fallback values reflect real dataset medians:
-      unit_price=691.73  discount_percent=10  pages_viewed=13
-      time_on_site_sec=903  engagement_score=0.509
-      discount_impact=0.057 (normalised)  price_per_page=0.030 (normalised)
-      location=111  marketing_channel=3  visit_season=2
+  FIX FEAT-D — _build_base_vector EXTENDED FOR ALL DERIVED FEATURES:
+    The function now builds all 11 derived features consistently with app.py.
 
-  All other fixes from v7.6 retained.
+  FIX FEAT-E — _apply_strategy_modifications RECOMPUTES ALL DERIVED FEATURES:
+    All 11 derived features are now recomputed after modifications, not just
+    the original 3 (engagement_score, discount_impact, price_per_page).
+
+  All fixes from v7.8 retained (OBJ-A/B/C, REGRESSOR-A/B/C/D).
 """
 
 from typing import Dict, Any, List, Optional
@@ -89,33 +97,85 @@ SEGMENT_TO_INT = {
 
 
 # ════════════════════════════════════════════════════════════════
-#  SAFE DEFAULTS — FIX REGRESSOR-D: real dataset medians
-#  discount_impact and price_per_page are NORMALISED (0–1)
+#  SAFE DEFAULTS — ALIGNED WITH app.py v15.0.0 _SAFE_DEFAULTS
+#  All raw and derived interaction features included.
+#  NOTE: discount_impact and price_per_page are RAW values here;
+#  they are normalised inside _build_base_vector / _apply_strategy_modifications
+#  using di_99 / ppp_99 from the pkl bundle.
 # ════════════════════════════════════════════════════════════════
 
 _SAFE_DEFAULTS = {
-    "device_type":       1.0,
-    "user_type":         1.0,
-    "marketing_channel": 3.0,        # Email
-    "product_category":  4.0,
-    "unit_price":        691.73,     # real median
-    "quantity":          2.0,        # real median — FIX: was missing
-    "discount_percent":  10.0,       # real median
-    "discount_amount":   65.815,     # real median — FIX: was missing
-    "pages_viewed":      13.0,       # real median
-    "time_on_site_sec":  903.0,      # real median
-    "rating":            4.0,
-    "payment_method":    2.0,
-    "visit_day":         16.0,
-    "visit_month":       7.0,
-    "visit_weekday":     3.0,
-    "visit_season":      2.0,
-    "location":          111.0,      # real median
-    "engagement_score":  0.509,      # real median
-    # NORMALISED — see FIX REGRESSOR-D
-    "discount_impact":   0.057,      # (10 * 691.73) / di_99
-    "price_per_page":    0.030,      # (691.73 / 13)  / ppp_99
+    # ── Raw features (ECO_RAW_FEATURES) ──────────────────────────
+    "device_type":        1.0,
+    "user_type":          1.0,
+    "marketing_channel":  3.0,        # Email
+    "product_category":   4.0,
+    "unit_price":         691.73,     # real median
+    "quantity":           2.0,        # real median
+    "discount_percent":   10.0,       # real median
+    "discount_amount":    65.815,     # real median (disc_pct * unit_price / 100 * qty)
+    "pages_viewed":       13.0,       # real median
+    "time_on_site_sec":   903.0,      # real median
+    "payment_method":     2.0,
+    "visit_day":          16.0,
+    "visit_month":        7.0,
+    "visit_weekday":      3.0,
+    "visit_season":       2.0,
+    "location":           111.0,      # real median
+    "added_to_cart":      0.64,       # real median probability
+    "rating":             4.0,        # real median product rating
+    # ── Derived features (ECO_DERIVED_FEATURES) ──────────────────
+    "engagement_score":   0.509,      # real median (normalised 0–1)
+    "discount_impact":    6917.3,     # raw: disc_pct * unit_price (normalised in fn)
+    "price_per_page":     53.21,      # raw: unit_price / pages_viewed (normalised in fn)
+    "time_per_page":      69.46,      # time_on_site_sec / pages_viewed
+    "cart_engage":        0.326,      # added_to_cart * engagement_score
+    "cart_time_ratio":    0.323,      # added_to_cart * (time / max_time)
+    "cart_pages_ratio":   0.348,      # added_to_cart * (pages / max_pages)
+    "is_weekend":         0.286,      # fraction of weekend visits
+    "ch_x_user":          22.0,       # marketing_channel * 7 + user_type
+    "season_x_cat":       18.0,       # visit_season * 8 + product_category
+    "price_x_disc":       69.17,      # unit_price * discount_percent / 100
 }
+
+
+# ════════════════════════════════════════════════════════════════
+#  ECO_FEATURES — MUST EXACTLY MATCH app.py v15.0.0
+#  ECO_RAW_FEATURES + ECO_DERIVED_FEATURES
+#  v8.0 FIX: quantity, discount_amount, rating restored to match app.py training.
+#  PKL bundle feature_cols is authoritative for scoring matrix shape.
+# ════════════════════════════════════════════════════════════════
+
+# Raw features — must match app.py ECO_RAW_FEATURES exactly
+# app.py trains WITH quantity, discount_amount, rating — PKL feature_cols includes them
+ECO_RAW_FEATURES = [
+    "device_type", "user_type", "marketing_channel", "product_category",
+    "unit_price", "quantity", "discount_percent", "discount_amount",
+    "pages_viewed", "time_on_site_sec",
+    "added_to_cart",
+    "rating", "payment_method", "visit_day", "visit_month",
+    "visit_weekday", "visit_season", "location",
+]
+
+# Derived features computed post-split (exact match with app.py ECO_DERIVED_FEATURES)
+ECO_DERIVED_FEATURES = [
+    "engagement_score",
+    "discount_impact",
+    "price_per_page",
+    "time_per_page",
+    "cart_engage",
+    "cart_time_ratio",
+    "cart_pages_ratio",
+    "is_weekend",
+    "ch_x_user",
+    "season_x_cat",
+    "price_x_disc",
+]
+
+# Full feature list — used for strategy vector building and PKL scoring
+ECO_FEATURES = ECO_RAW_FEATURES + ECO_DERIVED_FEATURES
+
+WHATIF_DISCOUNT_LEVELS = [5, 10, 15, 20, 25, 30]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -216,17 +276,6 @@ DEFAULT_OBJECTIVE_WEIGHTS = {
     "optimize_marketing_roi":  {"roi": 80,    "ctr": 10,        "conversion": 5, "abandon": 5},
 }
 
-ECO_FEATURES = [
-    "device_type", "user_type", "marketing_channel", "product_category",
-    "unit_price", "quantity", "discount_percent", "discount_amount",
-    "pages_viewed", "time_on_site_sec",
-    "rating", "payment_method", "visit_day", "visit_month",
-    "visit_weekday", "visit_season", "location",
-    "engagement_score", "discount_impact", "price_per_page",
-]
-
-WHATIF_DISCOUNT_LEVELS = [5, 10, 15, 20, 25, 30]
-
 
 # ════════════════════════════════════════════════════════════════
 #  CHANNEL / SEGMENT AFFINITY HELPERS
@@ -312,19 +361,26 @@ def run(
     learned_mechanism_strengths: Optional[Dict[str, Any]] = None,
     learned_objective_weights:   Optional[Dict[str, Any]] = None,
     kpi_predictor_path:          Optional[str]  = None,
+    kpi_predictor_bundle:        Optional[Dict[str, Any]] = None,
     feature_importance:          Optional[list] = None,
     uploads_dir:                 Optional[str]  = None,
     dataset_stats:               Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
 
-    if not kpi_predictor_path or not os.path.exists(kpi_predictor_path):
+    # Accept either a pre-loaded bundle dict (from GridFS via app.py)
+    # or fall back to loading from disk path (legacy local-only path).
+    if kpi_predictor_bundle is not None:
+        reg_bundle = kpi_predictor_bundle
+    elif kpi_predictor_path and os.path.exists(kpi_predictor_path):
+        # Legacy: load from disk (kept for backward-compat / testing)
+        with open(kpi_predictor_path, "rb") as f:
+            reg_bundle = pickle.load(f)
+    else:
         raise ValueError(
-            f"[SimulationAgent] kpi_predictor_path is required but was "
-            f"'{kpi_predictor_path}'. Please retrain."
+            f"[SimulationAgent] kpi_predictor bundle not provided and path "
+            f"'{kpi_predictor_path}' not found on disk. "
+            f"PKLs are stored in GridFS — app.py must load and pass kpi_predictor_bundle."
         )
-
-    with open(kpi_predictor_path, "rb") as f:
-        reg_bundle = pickle.load(f)
 
     kpi_regressor = reg_bundle["model"]
     reg_features  = reg_bundle.get("features", ECO_FEATURES)
@@ -388,15 +444,23 @@ def run(
         f"di_99={di_99:.1f} ppp_99={ppp_99:.2f}"
     )
 
-    merged_directions = _get_importance_driven_directions(fix_directions, feature_importance)
-    merged_directions = [
-        d for d in merged_directions
-        if d in OBJECTIVE_ALLOWED.get(objective, list(STRATEGY_MECHANISMS.keys()))
-    ]
-    for d in OBJECTIVE_ALLOWED.get(objective, []):
-        if d not in merged_directions and d in STRATEGY_MECHANISMS:
-            merged_directions.append(d)
-    print(f"[Sim] Directions after objective filter ({objective}): {merged_directions}")
+    # FIX OBJ-A / OBJ-B: directions are computed AND filtered to OBJECTIVE_ALLOWED in one step.
+    allowed_for_objective = OBJECTIVE_ALLOWED.get(objective, list(STRATEGY_MECHANISMS.keys()))
+    merged_directions = _get_importance_driven_directions(
+        fix_directions, feature_importance, objective
+    )
+    # Final safety net — deduplicate while preserving order
+    seen = set()
+    merged_directions_deduped = []
+    for d in merged_directions:
+        if d not in seen:
+            seen.add(d)
+            merged_directions_deduped.append(d)
+    merged_directions = merged_directions_deduped
+    print(
+        f"[Sim] Directions for objective '{objective}' (allowed={allowed_for_objective}): "
+        f"{merged_directions}"
+    )
 
     strategies: List[Dict[str, Any]] = []
 
@@ -457,7 +521,7 @@ def run(
         s["rank"] = i + 1
 
     _rescale_scores(strategies)
-    _enrich_strategies(strategies, objective, real_conv, real_roi)
+    _enrich_strategies(strategies, objective, real_conv, real_roi, real_abandon, real_ctr)
 
     whatif_table = _build_whatif_table(
         base_vector, reg_features, reg_targets, kpi_regressor,
@@ -499,7 +563,8 @@ def run(
 
 
 # ════════════════════════════════════════════════════════════════
-#  BASE VECTOR — FIX REGRESSOR-B
+#  BASE VECTOR — FIX REGRESSOR-B + FIX FEAT-D
+#  Builds ALL derived features including new interaction features
 # ════════════════════════════════════════════════════════════════
 
 def _build_base_vector(
@@ -512,32 +577,46 @@ def _build_base_vector(
 ) -> Dict[str, float]:
     """
     Build the base feature vector with NORMALISED discount_impact / price_per_page.
+    FIX FEAT-D: now also builds all 11 derived interaction features.
     """
     base: Dict[str, float] = {}
     ds = dataset_stats or {}
 
+    # Build raw features from dataset_stats medians or SAFE_DEFAULTS
     for feat in reg_features:
-        if feat in ("discount_impact", "price_per_page"):
+        if feat in ECO_DERIVED_FEATURES:
             continue  # handled below
         if ds and feat in ds and isinstance(ds[feat], dict):
             base[feat] = float(ds[feat].get("median", _SAFE_DEFAULTS.get(feat, 0.0)))
         else:
             base[feat] = _SAFE_DEFAULTS.get(feat, 0.0)
 
-    # Compute normalised derived features from the base raw values
+    # Retrieve raw values for derived feature computation
     pages = max(float(base.get("pages_viewed",     _SAFE_DEFAULTS["pages_viewed"])),  1.0)
     time_ = float(base.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]))
     price = float(base.get("unit_price",       _SAFE_DEFAULTS["unit_price"]))
     disc  = float(base.get("discount_percent", _SAFE_DEFAULTS["discount_percent"]))
+    atc   = float(base.get("added_to_cart",    _SAFE_DEFAULTS["added_to_cart"]))
+    mc    = float(base.get("marketing_channel", _SAFE_DEFAULTS["marketing_channel"]))
+    ut    = float(base.get("user_type",        _SAFE_DEFAULTS["user_type"]))
+    vs    = float(base.get("visit_season",     _SAFE_DEFAULTS["visit_season"]))
+    pc    = float(base.get("product_category", _SAFE_DEFAULTS["product_category"]))
+    wd    = float(base.get("visit_weekday",    _SAFE_DEFAULTS["visit_weekday"]))
 
-    if "engagement_score" in reg_features:
-        base["engagement_score"] = float(
-            np.clip((pages / max_pages) * 0.4 + (time_ / max_time) * 0.6, 0, 1)
-        )
-    if "discount_impact" in reg_features:
-        base["discount_impact"] = float(np.clip((disc * price) / max(di_99, 1.0), 0, 1.5))
-    if "price_per_page" in reg_features:
-        base["price_per_page"] = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
+    # Compute all derived features consistently with app.py v15.0.0
+    engagement = float(np.clip((pages / max_pages) * 0.4 + (time_ / max_time) * 0.6, 0, 1))
+
+    if "engagement_score"  in reg_features: base["engagement_score"]  = engagement
+    if "discount_impact"   in reg_features: base["discount_impact"]   = float(np.clip((disc * price) / max(di_99,  1.0), 0, 1.5))
+    if "price_per_page"    in reg_features: base["price_per_page"]    = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
+    if "time_per_page"     in reg_features: base["time_per_page"]     = float(time_ / pages)
+    if "cart_engage"       in reg_features: base["cart_engage"]       = float(atc * engagement)
+    if "cart_time_ratio"   in reg_features: base["cart_time_ratio"]   = float(atc * (time_ / max(max_time, 1.0)))
+    if "cart_pages_ratio"  in reg_features: base["cart_pages_ratio"]  = float(atc * (pages / max(max_pages, 1.0)))
+    if "is_weekend"        in reg_features: base["is_weekend"]        = float(wd >= 5)
+    if "ch_x_user"         in reg_features: base["ch_x_user"]         = float(mc * 7 + ut)
+    if "season_x_cat"      in reg_features: base["season_x_cat"]      = float(vs * 8 + pc)
+    if "price_x_disc"      in reg_features: base["price_x_disc"]      = float(price * disc / 100.0)
 
     return base
 
@@ -562,7 +641,7 @@ def _compute_primary_kpi_bonus(strat, objective, real_roi, real_conv, real_aband
 
 
 # ════════════════════════════════════════════════════════════════
-#  WHAT-IF TABLE — FIX REGRESSOR-C
+#  WHAT-IF TABLE
 # ════════════════════════════════════════════════════════════════
 
 def _build_whatif_table(
@@ -577,25 +656,30 @@ def _build_whatif_table(
     for disc_pct in WHATIF_DISCOUNT_LEVELS:
         vec   = dict(base_vector)
         price = vec.get("unit_price", _SAFE_DEFAULTS["unit_price"])
+        pages = max(float(vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"])), 1.0)
+        time_ = float(vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]))
+        atc   = float(vec.get("added_to_cart",    _SAFE_DEFAULTS["added_to_cart"]))
+        mc    = float(vec.get("marketing_channel", _SAFE_DEFAULTS["marketing_channel"]))
+        ut    = float(vec.get("user_type",         _SAFE_DEFAULTS["user_type"]))
+        vs    = float(vec.get("visit_season",      _SAFE_DEFAULTS["visit_season"]))
+        pc    = float(vec.get("product_category",  _SAFE_DEFAULTS["product_category"]))
+        wd    = float(vec.get("visit_weekday",     _SAFE_DEFAULTS["visit_weekday"]))
 
         vec["discount_percent"] = float(disc_pct)
 
-        # FIX: update discount_amount to match new discount_percent
-        if "discount_amount" in vec:
-            qty = float(vec.get("quantity", _SAFE_DEFAULTS.get("quantity", 2.0)))
-            vec["discount_amount"] = float(disc_pct / 100.0 * price * qty)
-
-        # Update normalised derived features
-        pages = max(float(vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"])), 1.0)
-        time_ = float(vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]))
-        if "engagement_score" in vec:
-            vec["engagement_score"] = float(
-                np.clip((pages / max_pages) * 0.4 + (time_ / max_time) * 0.6, 0, 1)
-            )
-        if "discount_impact" in vec:
-            vec["discount_impact"] = float(np.clip((disc_pct * price) / max(di_99, 1.0), 0, 1.5))
-        if "price_per_page" in vec:
-            vec["price_per_page"] = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
+        # Recompute ALL derived features after discount change
+        engagement = float(np.clip((pages / max_pages) * 0.4 + (time_ / max_time) * 0.6, 0, 1))
+        if "engagement_score"  in vec: vec["engagement_score"]  = engagement
+        if "discount_impact"   in vec: vec["discount_impact"]   = float(np.clip((disc_pct * price) / max(di_99, 1.0), 0, 1.5))
+        if "price_per_page"    in vec: vec["price_per_page"]    = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
+        if "time_per_page"     in vec: vec["time_per_page"]     = float(time_ / pages)
+        if "cart_engage"       in vec: vec["cart_engage"]       = float(atc * engagement)
+        if "cart_time_ratio"   in vec: vec["cart_time_ratio"]   = float(atc * (time_ / max(max_time, 1.0)))
+        if "cart_pages_ratio"  in vec: vec["cart_pages_ratio"]  = float(atc * (pages / max(max_pages, 1.0)))
+        if "is_weekend"        in vec: vec["is_weekend"]        = float(wd >= 5)
+        if "ch_x_user"         in vec: vec["ch_x_user"]         = float(mc * 7 + ut)
+        if "season_x_cat"      in vec: vec["season_x_cat"]      = float(vs * 8 + pc)
+        if "price_x_disc"      in vec: vec["price_x_disc"]      = float(price * disc_pct / 100.0)
 
         X    = np.array([[vec.get(f, base_vector.get(f, 0.0)) for f in reg_features]])
         pred = kpi_regressor.predict(X)[0]
@@ -622,7 +706,7 @@ def _build_whatif_table(
 
 
 # ════════════════════════════════════════════════════════════════
-#  ML-BASED KPI PROJECTION — FIX REGRESSOR-C
+#  ML-BASED KPI PROJECTION
 # ════════════════════════════════════════════════════════════════
 
 def _ml_project_kpis(
@@ -706,7 +790,7 @@ def _ml_project_kpis(
 
 
 # ════════════════════════════════════════════════════════════════
-#  STRATEGY MODIFICATIONS — FIX REGRESSOR-C: normalised derived feats
+#  STRATEGY MODIFICATIONS — FIX FEAT-E: recompute ALL derived features
 # ════════════════════════════════════════════════════════════════
 
 def _apply_strategy_modifications(
@@ -719,19 +803,22 @@ def _apply_strategy_modifications(
     ppp_99:    float = 1.0,
 ) -> dict:
     """
-    Apply feature changes for a strategy.  All modifications work on raw
-    pages/time/price/disc, then recompute normalised derived features at the end.
+    Apply feature changes for a strategy. All modifications work on raw
+    pages/time/price/disc, then recompute ALL derived features at the end.
+    FIX FEAT-E: now recomputes all 11 interaction features, not just 3.
     """
     if strategy_id == "offer_discount":
         vec["discount_percent"]  = float(params.get("discount_pct", 10.0)) + 20.0
         vec["marketing_channel"] = CHANNEL_TO_INT.get("Email", 3)
         vec["user_type"]         = 1.0
+        vec["added_to_cart"]     = 1.0
 
     elif strategy_id == "retargeting_campaign":
         ch = params.get("channel", "Email")
         vec["marketing_channel"] = float(CHANNEL_TO_INT.get(ch, 3))
         vec["pages_viewed"]      = vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"]) * 1.30
         vec["time_on_site_sec"]  = vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]) * 1.25
+        vec["added_to_cart"]     = 0.9
 
     elif strategy_id == "increase_ad_budget":
         ch  = params.get("channel", "Email")
@@ -745,11 +832,13 @@ def _apply_strategy_modifications(
         vec["pages_viewed"]      = vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"]) + 4.0
         vec["time_on_site_sec"]  = vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]) + 90.0
         vec["discount_percent"]  = 0.0
+        vec["added_to_cart"]     = 1.0
 
     elif strategy_id == "add_urgency_signals":
         vec["pages_viewed"]      = vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"]) * 1.20
         vec["time_on_site_sec"]  = vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]) * 0.90
         vec["discount_percent"]  = float(params.get("discount_pct", 5.0))
+        vec["added_to_cart"]     = vec.get("added_to_cart", _SAFE_DEFAULTS["added_to_cart"]) * 1.2
 
     elif strategy_id == "reallocate_channel_budget":
         vec["marketing_channel"] = float(CHANNEL_TO_INT.get("Email", 3))
@@ -765,6 +854,7 @@ def _apply_strategy_modifications(
         vec["user_type"]         = 0.0   # user_type=0 has higher conv in this dataset
         vec["pages_viewed"]      = vec.get("pages_viewed", _SAFE_DEFAULTS["pages_viewed"]) * 1.20
         vec["time_on_site_sec"]  = vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]) * 1.15
+        vec["added_to_cart"]     = vec.get("added_to_cart", _SAFE_DEFAULTS["added_to_cart"]) * 1.1
 
     elif strategy_id == "user_strategy":
         actual_discount = float(params.get("discount", 0))
@@ -779,25 +869,31 @@ def _apply_strategy_modifications(
             vec["pages_viewed"]     = vec.get("pages_viewed",     _SAFE_DEFAULTS["pages_viewed"])     * min(scale, 1.25)
             vec["time_on_site_sec"] = vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]) * min(scale, 1.20)
 
-    # ── Recompute normalised derived features ────────────────────────────
+    # ── Recompute ALL derived features after modifications — FIX FEAT-E ──────
     pages = max(float(vec.get("pages_viewed",     _SAFE_DEFAULTS["pages_viewed"])),  1.0)
     time_ = float(vec.get("time_on_site_sec", _SAFE_DEFAULTS["time_on_site_sec"]))
     price = float(vec.get("unit_price",       _SAFE_DEFAULTS["unit_price"]))
     disc  = float(vec.get("discount_percent", _SAFE_DEFAULTS["discount_percent"]))
+    atc   = float(vec.get("added_to_cart",    _SAFE_DEFAULTS["added_to_cart"]))
+    mc    = float(vec.get("marketing_channel", _SAFE_DEFAULTS["marketing_channel"]))
+    ut    = float(vec.get("user_type",        _SAFE_DEFAULTS["user_type"]))
+    vs    = float(vec.get("visit_season",     _SAFE_DEFAULTS["visit_season"]))
+    pc    = float(vec.get("product_category", _SAFE_DEFAULTS["product_category"]))
+    wd    = float(vec.get("visit_weekday",    _SAFE_DEFAULTS["visit_weekday"]))
 
-    if "engagement_score" in vec:
-        vec["engagement_score"] = float(
-            np.clip((pages / max_pages) * 0.4 + (time_ / max_time) * 0.6, 0, 1)
-        )
-    # FIX REGRESSOR-C: store NORMALISED values matching training scale
-    if "discount_impact" in vec:
-        vec["discount_impact"] = float(np.clip((disc * price) / max(di_99, 1.0), 0, 1.5))
-    if "price_per_page" in vec:
-        vec["price_per_page"] = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
-    # FIX: recompute discount_amount whenever discount_percent changes
-    if "discount_amount" in vec:
-        qty = float(vec.get("quantity", _SAFE_DEFAULTS.get("quantity", 2.0)))
-        vec["discount_amount"] = round(disc / 100.0 * price * qty, 4)
+    engagement = float(np.clip((pages / max_pages) * 0.4 + (time_ / max_time) * 0.6, 0, 1))
+
+    if "engagement_score"  in vec: vec["engagement_score"]  = engagement
+    if "discount_impact"   in vec: vec["discount_impact"]   = float(np.clip((disc * price) / max(di_99,  1.0), 0, 1.5))
+    if "price_per_page"    in vec: vec["price_per_page"]    = float(np.clip((price / pages) / max(ppp_99, 1.0), 0, 1.5))
+    if "time_per_page"     in vec: vec["time_per_page"]     = float(time_ / pages)
+    if "cart_engage"       in vec: vec["cart_engage"]       = float(atc * engagement)
+    if "cart_time_ratio"   in vec: vec["cart_time_ratio"]   = float(atc * (time_ / max(max_time, 1.0)))
+    if "cart_pages_ratio"  in vec: vec["cart_pages_ratio"]  = float(atc * (pages / max(max_pages, 1.0)))
+    if "is_weekend"        in vec: vec["is_weekend"]        = float(wd >= 5)
+    if "ch_x_user"         in vec: vec["ch_x_user"]         = float(mc * 7 + ut)
+    if "season_x_cat"      in vec: vec["season_x_cat"]      = float(vs * 8 + pc)
+    if "price_x_disc"      in vec: vec["price_x_disc"]      = float(price * disc / 100.0)
 
     return vec
 
@@ -946,7 +1042,7 @@ def _build_user_strategy(
 #  ENRICHMENT
 # ════════════════════════════════════════════════════════════════
 
-def _enrich_strategies(strategies, objective, real_conv, real_roi):
+def _enrich_strategies(strategies, objective, real_conv, real_roi, real_abandon=0.0, real_ctr=0.0):
     if not strategies:
         return
     best      = strategies[0]
@@ -959,13 +1055,26 @@ def _enrich_strategies(strategies, objective, real_conv, real_roi):
     }
     kpi_key, kpi_label, direction = KPI_FOCUS.get(
         objective, ("conversionRate", "conversion rate", "higher"))
+
+    # FIX OBJ-C: use the correct real KPI baseline for the primary metric
+    real_kpi_map = {
+        "conversionRate":  real_conv,
+        "cartAbandonment": real_abandon,
+        "roi":             real_roi,
+        "ctr":             real_ctr,
+    }
+    real_val = real_kpi_map.get(kpi_key, real_conv)
+
     for i, strat in enumerate(strategies):
         proj    = strat.get("projectedMetrics", {})
         score   = strat.get("score", 0)
         sid     = strat.get("id", "")
         proj_val  = proj.get(kpi_key, 0)
-        real_val  = real_conv if kpi_key == "conversionRate" else real_roi
-        delta     = round(proj_val - real_val, 4)
+        # For lower-is-better (cart abandonment): improvement = decrease
+        if direction == "lower":
+            delta = round(real_val - proj_val, 4)
+        else:
+            delta = round(proj_val - real_val, 4)
         delta_str = f"+{delta:.4f}" if delta >= 0 else f"{delta:.4f}"
         strat["whySelected"] = (
             f"This strategy improves {kpi_label} by {delta_str} "
@@ -973,7 +1082,10 @@ def _enrich_strategies(strategies, objective, real_conv, real_roi):
         )
         if i > 0:
             best_val  = best_proj.get(kpi_key, 0)
-            gap_label = round(abs(best_val - proj_val), 4)
+            if direction == "lower":
+                gap_label = round(abs(proj_val - best_val), 4)
+            else:
+                gap_label = round(abs(best_val - proj_val), 4)
             strat["whyNotSelected"] = (
                 f"This strategy was not ranked #1 because it projects a {kpi_label} of "
                 f"{proj_val:.4f} vs {best_val:.4f} for the top pick "
@@ -1014,35 +1126,72 @@ def _strategy_mechanism_explanation(strategy_id: str, objective: str) -> str:
 
 # ════════════════════════════════════════════════════════════════
 #  DIRECTION SELECTION
+#  FIX OBJ-A: objective parameter added — function only returns
+#  strategies that belong to OBJECTIVE_ALLOWED[objective].
 # ════════════════════════════════════════════════════════════════
 
-def _get_importance_driven_directions(fix_directions, feature_importance):
+def _get_importance_driven_directions(fix_directions, feature_importance, objective: str = "increase_revenue"):
+    """
+    Return a ranked list of strategy directions valid for `objective`.
+
+    RULES:
+      1. Only directions in OBJECTIVE_ALLOWED[objective] are eligible.
+      2. Directions from the analyst's fixDirections are ranked first.
+      3. Remaining eligible directions are ranked by feature-importance
+         alignment score.
+      4. Any direction NOT in OBJECTIVE_ALLOWED[objective] is silently dropped.
+    """
+    allowed = OBJECTIVE_ALLOWED.get(objective, list(STRATEGY_MECHANISMS.keys()))
+
     if not fix_directions:
-        return [
-            "improve_checkout_ux", "retargeting_campaign", "offer_discount",
-            "reallocate_channel_budget", "increase_ad_budget",
-            "improve_ad_creative", "optimize_targeting",
-        ]
+        if not feature_importance:
+            return list(allowed)
+        feat_imp_dict = {f["feature"]: f["importance"] for f in feature_importance if "feature" in f}
+        STRAT_FEATURE_MAP = {
+            "offer_discount":            ["discount_percent", "discount_impact", "user_type", "price_x_disc"],
+            "retargeting_campaign":      ["marketing_channel", "engagement_score", "pages_viewed", "added_to_cart"],
+            "increase_ad_budget":        ["marketing_channel", "pages_viewed", "time_on_site_sec", "ch_x_user"],
+            "improve_checkout_ux":       ["pages_viewed", "time_on_site_sec", "engagement_score", "price_per_page", "cart_engage"],
+            "add_urgency_signals":       ["time_on_site_sec", "engagement_score", "cart_time_ratio"],
+            "reallocate_channel_budget": ["marketing_channel", "unit_price", "discount_impact", "ch_x_user"],
+            "improve_ad_creative":       ["marketing_channel", "pages_viewed", "engagement_score"],
+            "optimize_targeting":        ["marketing_channel", "user_type", "engagement_score", "ch_x_user"],
+        }
+        scored = {
+            d: sum(feat_imp_dict.get(f, 0.0) for f in STRAT_FEATURE_MAP.get(d, []))
+            for d in allowed
+        }
+        return sorted(allowed, key=lambda d: scored.get(d, 0.0), reverse=True)
+
+    # Build candidate list: analyst directions first, then remaining allowed directions
+    analyst_valid = [d for d in fix_directions if d in allowed]
+    remaining     = [d for d in allowed if d not in analyst_valid]
+
     if not feature_importance:
-        return fix_directions[:7]
+        return analyst_valid + remaining
+
     feat_imp_dict = {f["feature"]: f["importance"] for f in feature_importance if "feature" in f}
     STRAT_FEATURE_MAP = {
-        "offer_discount":            ["discount_percent", "discount_impact", "user_type"],
-        "retargeting_campaign":      ["marketing_channel", "engagement_score", "pages_viewed"],
-        "increase_ad_budget":        ["marketing_channel", "pages_viewed", "time_on_site_sec"],
-        "improve_checkout_ux":       ["pages_viewed", "time_on_site_sec", "engagement_score"],
-        "add_urgency_signals":       ["time_on_site_sec", "engagement_score"],
-        "reallocate_channel_budget": ["marketing_channel", "unit_price"],
-        "improve_ad_creative":       ["marketing_channel", "pages_viewed"],
-        "optimize_targeting":        ["marketing_channel", "user_type", "engagement_score"],
+        "offer_discount":            ["discount_percent", "discount_impact", "user_type", "price_x_disc"],
+        "retargeting_campaign":      ["marketing_channel", "engagement_score", "pages_viewed", "added_to_cart"],
+        "increase_ad_budget":        ["marketing_channel", "pages_viewed", "time_on_site_sec", "ch_x_user"],
+        "improve_checkout_ux":       ["pages_viewed", "time_on_site_sec", "engagement_score", "price_per_page", "cart_engage"],
+        "add_urgency_signals":       ["time_on_site_sec", "engagement_score", "cart_time_ratio"],
+        "reallocate_channel_budget": ["marketing_channel", "unit_price", "discount_impact", "ch_x_user"],
+        "improve_ad_creative":       ["marketing_channel", "pages_viewed", "engagement_score"],
+        "optimize_targeting":        ["marketing_channel", "user_type", "engagement_score", "ch_x_user"],
     }
-    all_known = list(STRATEGY_MECHANISMS.keys())
-    combined  = list(fix_directions) + [d for d in all_known if d not in fix_directions]
-    scored = {
+
+    combined = analyst_valid + remaining
+    scored   = {
         d: sum(feat_imp_dict.get(f, 0.0) for f in STRAT_FEATURE_MAP.get(d, []))
         for d in combined
     }
-    return sorted(combined, key=lambda d: scored.get(d, 0.0), reverse=True)[:7]
+    # Analyst directions get a priority boost so they appear first
+    for d in analyst_valid:
+        scored[d] = scored.get(d, 0.0) + 1000.0
+
+    return sorted(combined, key=lambda d: scored.get(d, 0.0), reverse=True)
 
 
 # ════════════════════════════════════════════════════════════════

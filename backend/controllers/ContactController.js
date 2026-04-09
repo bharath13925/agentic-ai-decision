@@ -177,9 +177,6 @@ function escapeHtml(str) {
     .replace(/'/g,  "&#39;");
 }
 
-/* ─────────────────────────────────────────────
-   Create transporter (per-request so env vars are always fresh)
-───────────────────────────────────────────── */
 function createTransporter() {
   const user = process.env.GMAIL_USER;
   const pass = process.env.GMAIL_APP_PASS;
@@ -197,10 +194,6 @@ function createTransporter() {
   });
 }
 
-/* ─────────────────────────────────────────────
-   POST /api/contact
-   Body: { name, email, message }
-───────────────────────────────────────────── */
 const sendContactMessage = async (req, res) => {
   try {
     const { name, email, message } = req.body;
@@ -237,10 +230,6 @@ const sendContactMessage = async (req, res) => {
       ipAddress: req.ip || req.headers["x-forwarded-for"] || "unknown",
     });
 
-    // ── Send email via nodemailer ──
-    // "from" must be the authenticated sender (GMAIL_USER).
-    // User's name/email goes in replyTo only — mixing them in "from" causes
-    // DMARC failures and spam-filter rejections on many providers.
     const transporter = createTransporter();
 
     await transporter.sendMail({

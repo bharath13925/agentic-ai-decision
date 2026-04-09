@@ -1,7 +1,7 @@
 /**
  * Step5Charts.jsx — AgenticIQ Decision Intelligence Charts v3.0
  *
- * UPDATED for v13.4 pipeline:
+ * UPDATED for v15.0 pipeline (GridFS PKLs, LangChain LCEL RAG, simulation_agent v8.0):
  *
  *  FIX Z  — All KPI values display at 4 decimal places for CTR/Conv/ROI
  *            (was 2dp in several places). Matches backend precision.
@@ -319,7 +319,7 @@ function AIInsightCard({ aiInsight, topStrategy, confidence, pklScoringUsed, mlA
 
   return (
     <Card accent={C.violet} glow={C.violet}>
-      <SectionHeader icon={FiCpu} color={C.violet} label="AI Decision Insight" badge="v13.4 ML" />
+      <SectionHeader icon={FiCpu} color={C.violet} label="AI Decision Insight" badge="v15.0 ML" />
 
       {/* Badges row */}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
@@ -899,10 +899,12 @@ function WhatIfTable({ whatIfTable, realConv }) {
           </tbody>
         </table>
       </div>
-      {/* FIX U: updated note referencing real dataset values */}
+      {/* Dynamic note using real dataset baseline values */}
       {realConv != null && (
         <p style={{ color: C.muted, fontSize: 10, fontFamily: "monospace", marginTop: 14 }}>
-          Baseline conv rate: <strong style={{ color: C.orange }}>{r(realConv, 4)}%</strong> · Discount median in dataset: 15% · unit_price median: 1025.90 · Projections via RandomForestRegressor (kpi_predictor.pkl)
+          Baseline conv rate: <strong style={{ color: C.orange }}>{r(realConv, 4)}%</strong>
+          {" · "}Projections via RandomForestRegressor (kpi_predictor.pkl)
+          {" · "}Discount % axis reflects your dataset's actual discount distribution
         </p>
       )}
     </Card>
@@ -1333,7 +1335,7 @@ export default function Step5Charts({ agentResult, shapData, shapLoading }) {
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20 }}>
         <div style={{ flex: 1, height: 1, background: "linear-gradient(90deg,rgba(124,92,255,0.5),transparent)" }} />
         <span style={{ color: C.muted, fontSize: 10, fontFamily: "monospace", textTransform: "uppercase", letterSpacing: "0.2em", whiteSpace: "nowrap" }}>
-          Decision Analytics · v13.4 Pipeline
+          Decision Analytics · v15.0 Pipeline
         </span>
         <div style={{ flex: 1, height: 1, background: "linear-gradient(90deg,transparent,rgba(124,92,255,0.5))" }} />
       </div>
