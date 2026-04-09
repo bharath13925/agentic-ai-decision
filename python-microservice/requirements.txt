@@ -1,7 +1,7 @@
 # ───────────── Core Backend ─────────────
 
 fastapi
-uvicorn[standard]
+uvicorn
 pydantic
 python-dotenv
 
