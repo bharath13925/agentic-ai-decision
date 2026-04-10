@@ -286,14 +286,15 @@ class EngineerRequest(BaseModel):
 
 
 class TrainRequest(BaseModel):
-    projectId:       str
-    mongoId:         str
-    mlResultId:      str
-    uploadsDir:      str
-    ecommerceFile:   str
-    marketingFile:   str
-    advertisingFile: str
-    objective:       str
+    projectId:          str
+    mongoId:            str
+    mlResultId:         str
+    uploadsDir:         str
+    ecommerceFile:      str
+    marketingFile:      str
+    advertisingFile:    str
+    objective:          str
+    useGridFsFallback:  Optional[bool] = True  # always try GridFS if disk files missing
 
 
 class ScoreStrategiesRequest(BaseModel):
@@ -602,6 +603,515 @@ def restore_engineered_csvs(req: RestoreCsvsRequest):
             "restored": [],
             "skipped":  [],
             "errors":   [str(e)],
+        }
+
+
+# ════════════════════════════════════════════════════════════════
+#  NEW v15.2 — POST /process-datasets
+#
+#  PRODUCTION FIX: Accepts base64 CSV content from the Node backend
+#  (instead of file paths). This works correctly when Node and Python
+#  run in SEPARATE Render containers with isolated /tmp filesystems.
+#
+#  Flow:
+#    1. Node reads uploaded files from its own /tmp, encodes to base64
+#    2. Sends base64 content here via JSON
+#    3. Python decodes, writes to ITS OWN /tmp, cleans + engineers
+#    4. Saves engineered CSVs to GridFS for persistence
+#    5. Returns kpiSummary + datasetStats to Node
+#
+#  This replaces the broken /clean-datasets + /engineer-features
+#  two-step flow which required shared /tmp (impossible on Render).
+# ════════════════════════════════════════════════════════════════
+
+class ProcessDatasetsRequest(BaseModel):
+    projectId:            str
+    mongoId:              str
+    ecommerceContent:     str   # base64-encoded CSV bytes
+    marketingContent:     str   # base64-encoded CSV bytes
+    advertisingContent:   str   # base64-encoded CSV bytes
+    ecommerceFilename:    Optional[str] = None
+    marketingFilename:    Optional[str] = None
+    advertisingFilename:  Optional[str] = None
+
+
+class EngineerFromGridFSRequest(BaseModel):
+    projectId: str
+    mongoId:   str
+
+
+@app.post("/process-datasets")
+def process_datasets(req: ProcessDatasetsRequest):
+    """
+    Combined clean + engineer endpoint that accepts base64 CSV content.
+    Used in production (Render) where Node and Python have separate /tmp.
+    """
+    import base64
+    import tempfile
+
+    try:
+        # ── Decode base64 content and write to Python's own /tmp ─────────────
+        tmp_dir = tempfile.mkdtemp(prefix=f"agentiq_{req.projectId}_")
+        print(f"[ProcessDatasets] Working dir: {tmp_dir}")
+
+        file_map = {
+            "ecommerce":   req.ecommerceContent,
+            "marketing":   req.marketingContent,
+            "advertising": req.advertisingContent,
+        }
+        raw_paths: Dict[str, str] = {}
+        for key, b64content in file_map.items():
+            try:
+                csv_bytes = base64.b64decode(b64content)
+            except Exception as decode_err:
+                return {
+                    "status":  "error",
+                    "message": f"Failed to decode {key} file: {decode_err}",
+                    "projectId": req.projectId,
+                    "engineeredFiles": {}, "kpiSummary": {},
+                }
+            raw_path = os.path.join(tmp_dir, f"{key}.csv")
+            with open(raw_path, "wb") as f:
+                f.write(csv_bytes)
+            raw_paths[key] = raw_path
+            print(f"[ProcessDatasets] {key}: decoded {round(len(csv_bytes)/1024, 1)}KB → {raw_path}")
+
+        # ── Step 1: Clean ─────────────────────────────────────────────────────
+        cleaned_dfs: Dict[str, pd.DataFrame] = {}
+        for key, raw_path in raw_paths.items():
+            df = pd.read_csv(raw_path, on_bad_lines="skip", low_memory=False)
+            before = len(df)
+            df.columns = (
+                df.columns.str.strip()
+                  .str.lower()
+                  .str.replace(" ", "_")
+                  .str.replace(r"[^\w]", "_", regex=True)
+            )
+            df = df.dropna(how="all").drop_duplicates()
+            if key == "ecommerce":
+                df = _clean_ecommerce(df)
+            elif key == "marketing":
+                df = _clean_marketing(df)
+            elif key == "advertising":
+                df = _clean_advertising(df)
+            df = df.reset_index(drop=True)
+            cleaned_dfs[key] = df
+            print(f"[ProcessDatasets] Clean {key}: {before} → {len(df)} rows")
+
+        df_eco = cleaned_dfs["ecommerce"]
+        df_mkt = cleaned_dfs["marketing"]
+        df_adv = cleaned_dfs["advertising"]
+
+        # ── Validate required columns ─────────────────────────────────────────
+        if "purchased" not in df_eco.columns:
+            return {
+                "status":  "error",
+                "message": (
+                    f"Ecommerce dataset is missing required 'purchased' column. "
+                    f"Available: {list(df_eco.columns)}"
+                ),
+                "projectId": req.projectId, "engineeredFiles": {}, "kpiSummary": {},
+            }
+        if "clicks" not in df_adv.columns or "displays" not in df_adv.columns:
+            return {
+                "status":  "error",
+                "message": (
+                    "Advertising dataset is missing 'clicks' and/or 'displays' columns. "
+                    f"Available: {list(df_adv.columns)}"
+                ),
+                "projectId": req.projectId, "engineeredFiles": {}, "kpiSummary": {},
+            }
+        valid_adv_rows = df_adv[df_adv["displays"] > 0]
+        if len(valid_adv_rows) == 0:
+            return {
+                "status":  "error",
+                "message": "Advertising dataset has no rows with displays > 0.",
+                "projectId": req.projectId, "engineeredFiles": {}, "kpiSummary": {},
+            }
+
+        # ── Step 2: Engineer features (same logic as /engineer-features) ──────
+        df_adv["ctr"] = df_adv.apply(
+            lambda r: round((r["clicks"] / r["displays"]) * 100, 4)
+            if r["displays"] > 0 else 0.0, axis=1,
+        )
+
+        df_eco["conversion_flag"] = df_eco["purchased"].astype(int)
+        df_eco["conversion_rate_pct"] = (
+            df_eco["conversion_flag"].rolling(window=1000, min_periods=1).mean().mul(100).round(4)
+        )
+
+        if "cart_abandoned" in df_eco.columns and "added_to_cart" in df_eco.columns:
+            df_eco["cart_abandon_flag"] = df_eco["cart_abandoned"].astype(int)
+            added     = df_eco["added_to_cart"].rolling(window=1000, min_periods=1).sum()
+            abandoned = df_eco["cart_abandoned"].rolling(window=1000, min_periods=1).sum()
+            df_eco["cart_abandonment_rate"] = (
+                (abandoned / added.replace(0, np.nan)).mul(100).fillna(0).round(4)
+            )
+        else:
+            df_eco["cart_abandon_flag"]    = 0
+            df_eco["cart_abandonment_rate"] = 0.0
+
+        if "revenue" in df_adv.columns and "cost" in df_adv.columns:
+            df_adv["roi_computed"] = df_adv.apply(
+                lambda r: round(r["revenue"] / r["cost"], 4) if r["cost"] > 0 else 0.0, axis=1,
+            )
+        if "revenue" in df_adv.columns and "clicks" in df_adv.columns:
+            df_adv["revenue_per_click"] = df_adv.apply(
+                lambda r: round(r["revenue"] / r["clicks"], 4) if r["clicks"] > 0 else 0.0, axis=1,
+            )
+        if "engagement_score" in df_mkt.columns:
+            max_eng = df_mkt["engagement_score"].max()
+            df_mkt["engagement_normalized"] = (
+                (df_mkt["engagement_score"] / max_eng).round(4) if max_eng > 0 else 0.0
+            )
+
+        raw_max_pages = (
+            pd.to_numeric(df_eco["pages_viewed"], errors="coerce").max()
+            if "pages_viewed" in df_eco.columns else np.nan
+        )
+        raw_max_time = (
+            pd.to_numeric(df_eco["time_on_site_sec"], errors="coerce").max()
+            if "time_on_site_sec" in df_eco.columns else np.nan
+        )
+        max_pages = float(raw_max_pages) if (raw_max_pages is not None and not math.isnan(raw_max_pages)) else 30.0
+        max_time  = float(raw_max_time)  if (raw_max_time  is not None and not math.isnan(raw_max_time))  else 1800.0
+        max_pages = max(max_pages, 1.0)
+        max_time  = max(max_time,  1.0)
+
+        if "pages_viewed" in df_eco.columns and "time_on_site_sec" in df_eco.columns:
+            pv = pd.to_numeric(df_eco["pages_viewed"],    errors="coerce").fillna(0)
+            ts = pd.to_numeric(df_eco["time_on_site_sec"], errors="coerce").fillna(0)
+            df_eco["engagement_score"] = (pv / max_pages * 0.4 + ts / max_time * 0.6).round(4)
+        else:
+            df_eco["engagement_score"] = 0.0
+
+        if "discount_percent" in df_eco.columns and "unit_price" in df_eco.columns:
+            dp = pd.to_numeric(df_eco["discount_percent"], errors="coerce").fillna(0)
+            up = pd.to_numeric(df_eco["unit_price"],       errors="coerce").fillna(0)
+            df_eco["discount_impact"] = (dp * up).round(4)
+
+        if "unit_price" in df_eco.columns and "pages_viewed" in df_eco.columns:
+            up = pd.to_numeric(df_eco["unit_price"],   errors="coerce").fillna(0)
+            pv = pd.to_numeric(df_eco["pages_viewed"], errors="coerce").replace(0, 1).fillna(1)
+            df_eco["price_per_page"] = (up / pv).round(4)
+
+        if "added_to_cart" in df_eco.columns and "engagement_score" in df_eco.columns:
+            atc = pd.to_numeric(df_eco["added_to_cart"],    errors="coerce").fillna(0)
+            eng = pd.to_numeric(df_eco["engagement_score"], errors="coerce").fillna(0)
+            pv2 = pd.to_numeric(df_eco["pages_viewed"],     errors="coerce").fillna(0)
+            ts2 = pd.to_numeric(df_eco["time_on_site_sec"], errors="coerce").fillna(0)
+            df_eco["cart_engage"]      = (atc * eng).round(4)
+            df_eco["cart_time_ratio"]  = (atc * (ts2 / max(max_time,  1.0))).round(4)
+            df_eco["cart_pages_ratio"] = (atc * (pv2 / max(max_pages, 1.0))).round(4)
+
+        if "visit_weekday" in df_eco.columns:
+            wd = pd.to_numeric(df_eco["visit_weekday"], errors="coerce").fillna(3)
+            df_eco["is_weekend"] = (wd >= 5).astype(float)
+
+        if "marketing_channel" in df_eco.columns and "user_type" in df_eco.columns:
+            mc = pd.to_numeric(df_eco["marketing_channel"], errors="coerce").fillna(3)
+            ut = pd.to_numeric(df_eco["user_type"],         errors="coerce").fillna(1)
+            df_eco["ch_x_user"] = (mc * 7 + ut).round(4)
+
+        if "visit_season" in df_eco.columns and "product_category" in df_eco.columns:
+            vs = pd.to_numeric(df_eco["visit_season"],     errors="coerce").fillna(2)
+            pc = pd.to_numeric(df_eco["product_category"], errors="coerce").fillna(4)
+            df_eco["season_x_cat"] = (vs * 8 + pc).round(4)
+
+        if "unit_price" in df_eco.columns and "discount_percent" in df_eco.columns:
+            up  = pd.to_numeric(df_eco["unit_price"],       errors="coerce").fillna(0)
+            dp2 = pd.to_numeric(df_eco["discount_percent"], errors="coerce").fillna(0)
+            df_eco["price_x_disc"] = (up * dp2 / 100.0).round(4)
+
+        if "pages_viewed" in df_eco.columns and "time_on_site_sec" in df_eco.columns:
+            pv3 = pd.to_numeric(df_eco["pages_viewed"],     errors="coerce").fillna(1).clip(lower=1)
+            ts3 = pd.to_numeric(df_eco["time_on_site_sec"], errors="coerce").fillna(0)
+            df_eco["time_per_page"] = (ts3 / pv3).round(4)
+
+        for col in ECO_DROP_COLUMNS:
+            if col in df_eco.columns:
+                df_eco = df_eco.drop(columns=[col])
+
+        # ── Step 3: Save engineered CSVs to GridFS ────────────────────────────
+        engineered_files: Dict[str, str] = {}
+        _ensure_gfs()
+
+        eng_map = {
+            "ecommerce":   (df_eco, _gfs_module.eco_csv_key if _GFS_AVAILABLE else None),
+            "marketing":   (df_mkt, _gfs_module.mkt_csv_key if _GFS_AVAILABLE else None),
+            "advertising": (df_adv, _gfs_module.adv_csv_key if _GFS_AVAILABLE else None),
+        }
+
+        for fname_key, (df, gfs_key_fn) in eng_map.items():
+            fname       = f"{req.projectId}-{fname_key}-engineered.csv"
+            rel_path    = f"engineered/{fname}"
+            engineered_files[fname_key] = rel_path
+
+            # Always save to GridFS in production (files live here)
+            if _GFS_AVAILABLE and gfs_key_fn:
+                try:
+                    csv_bytes = df.to_csv(index=False).encode("utf-8")
+                    gfs_key   = gfs_key_fn(req.projectId)
+                    _gfs_module.save_csv(csv_bytes, gfs_key,
+                                         metadata={"projectId": req.projectId, "type": fname_key})
+                    print(f"[ProcessDatasets] ✅ Saved to GridFS: {gfs_key}")
+                except Exception as gfs_err:
+                    print(f"[ProcessDatasets] ⚠️  GridFS save failed for {fname_key}: {gfs_err}")
+                    # Fall back to writing to local tmp
+                    eng_dir = os.path.join(tmp_dir, "engineered")
+                    os.makedirs(eng_dir, exist_ok=True)
+                    df.to_csv(os.path.join(eng_dir, fname), index=False)
+            else:
+                # Local dev: write to disk only
+                eng_dir = os.path.join(UPLOADS_DIR, "engineered")
+                os.makedirs(eng_dir, exist_ok=True)
+                df.to_csv(os.path.join(eng_dir, fname), index=False)
+                print(f"[ProcessDatasets] Saved to disk (local dev): {eng_dir}/{fname}")
+
+        # ── Step 4: Compute KPI summary ───────────────────────────────────────
+        def safe(val: Any) -> float:
+            if val is None: return 0.0
+            try:
+                v = float(val)
+                return 0.0 if (math.isnan(v) or math.isinf(v)) else round(v, 4)
+            except Exception: return 0.0
+
+        total_purchases  = int(df_eco["purchased"].sum())
+        total_visits     = len(df_eco)
+        total_cart_added = int(df_eco["added_to_cart"].sum()) if "added_to_cart" in df_eco.columns else 0
+        total_abandoned  = int(df_eco["cart_abandoned"].sum()) if "cart_abandoned" in df_eco.columns else 0
+
+        df_adv_valid = df_adv[df_adv["displays"] > 0]
+        avg_ctr     = safe(df_adv_valid["ctr"].mean() if "ctr" in df_adv_valid.columns else 0)
+        avg_conv    = safe((total_purchases / total_visits * 100) if total_visits > 0 else 0)
+        avg_abandon = safe((total_abandoned / total_cart_added * 100) if total_cart_added > 0 else 0)
+
+        if "roi" in df_mkt.columns:
+            df_mkt_r = df_mkt.copy()
+            df_mkt_r["roi"] = pd.to_numeric(df_mkt_r["roi"], errors="coerce")
+            avg_roi = safe(df_mkt_r[df_mkt_r["roi"] > 0]["roi"].mean())
+        else:
+            avg_roi = 0.0
+
+        dataset_stats: Dict[str, Any] = {}
+        for feat in ECO_FEATURES:
+            if feat in df_eco.columns:
+                dataset_stats[feat] = _safe_stat_dict(df_eco[feat])
+
+        dataset_stats["_max_pages"] = _safe_num(max_pages, 30.0)
+        dataset_stats["_max_time"]  = _safe_num(max_time,  1800.0)
+
+        channel_conv_rates: Dict[str, float] = {}
+        if "marketing_channel" in df_eco.columns:
+            ch_col = pd.to_numeric(df_eco["marketing_channel"], errors="coerce").dropna()
+            for ch_int in ch_col.unique():
+                ch_clean = int(ch_int)
+                grp = df_eco[pd.to_numeric(df_eco["marketing_channel"], errors="coerce") == ch_int]
+                if len(grp) >= 10 and "purchased" in grp.columns:
+                    conv_rate = _safe_num(grp["purchased"].mean() * 100)
+                    ch_name   = INT_TO_CHANNEL.get(ch_clean, str(ch_clean))
+                    channel_conv_rates[ch_name]       = conv_rate
+                    channel_conv_rates[str(ch_clean)] = conv_rate
+
+        dataset_stats["channel_conv_rates"] = channel_conv_rates
+
+        segment_conv_rates:    Dict[str, float] = {}
+        segment_abandon_rates: Dict[str, float] = {}
+
+        if "user_type" in df_eco.columns:
+            overall_conv = float(df_eco["purchased"].mean()) if total_visits > 0 else 1.0
+            overall_conv = max(overall_conv, 0.001)
+            for ut_val in pd.to_numeric(df_eco["user_type"], errors="coerce").dropna().unique():
+                ut_int = int(ut_val)
+                grp    = df_eco[pd.to_numeric(df_eco["user_type"], errors="coerce") == ut_val]
+                if len(grp) >= 10:
+                    conv_ratio = _safe_num(float(grp["purchased"].mean()) / overall_conv)
+                    segment_conv_rates[str(ut_int)] = conv_ratio
+                    if "cart_abandoned" in grp.columns and "added_to_cart" in grp.columns:
+                        added_g     = grp["added_to_cart"].sum()
+                        abandoned_g = grp["cart_abandoned"].sum()
+                        if added_g > 0:
+                            overall_abn = total_abandoned / max(total_cart_added, 1)
+                            seg_abn     = abandoned_g / added_g
+                            segment_abandon_rates[str(ut_int)] = _safe_num(
+                                seg_abn / max(overall_abn, 0.001)
+                            )
+
+        dataset_stats["segment_conv_rates"]    = segment_conv_rates
+        dataset_stats["segment_abandon_rates"] = segment_abandon_rates
+
+        kpi_summary = {
+            "avgCTR":             avg_ctr,
+            "avgConversionRate":  avg_conv,
+            "avgCartAbandonment": avg_abandon,
+            "avgROI":             avg_roi,
+            "totalRevenue":       safe(df_eco["revenue"].sum() if "revenue" in df_eco.columns else 0),
+            "totalClicks":        safe(df_adv["clicks"].sum()  if "clicks"  in df_adv.columns else 0),
+            "totalImpressions":   safe(df_adv["displays"].sum() if "displays" in df_adv.columns else 0),
+            "totalSessions":      total_visits,
+            "totalPurchases":     total_purchases,
+            "totalCartAdded":     total_cart_added,
+            "totalAbandoned":     total_abandoned,
+        }
+        print(f"[ProcessDatasets] ✅ Done | KPIs: {kpi_summary}")
+
+        # ── Cleanup temp directory ────────────────────────────────────────────
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        return {
+            "status":          "success",
+            "message":         "Datasets processed (clean + engineer) successfully.",
+            "projectId":       req.projectId,
+            "cleanedFiles": {
+                "ecommerce":   f"cleaned/{req.projectId}-ecommerce-cleaned.csv",
+                "marketing":   f"cleaned/{req.projectId}-marketing-cleaned.csv",
+                "advertising": f"cleaned/{req.projectId}-advertising-cleaned.csv",
+            },
+            "engineeredFiles": engineered_files,
+            "kpiSummary":      kpi_summary,
+            "datasetStats":    dataset_stats,
+        }
+
+    except Exception as e:
+        err_detail = f"{type(e).__name__}: {e}\n{_tb.format_exc()}"
+        print(f"[ProcessDatasets] ❌ EXCEPTION: {err_detail}")
+        return {
+            "status":  "error",
+            "message": err_detail,
+            "projectId": req.projectId,
+            "engineeredFiles": {}, "kpiSummary": {},
+        }
+
+
+# ════════════════════════════════════════════════════════════════
+#  NEW v15.2 — POST /engineer-from-gridfs
+#
+#  Re-runs feature engineering using cleaned CSVs stored in GridFS.
+#  Used when resuming a project stuck at "cleaned" status.
+#  (In v15.2 cleaned CSVs are NOT stored in GridFS — this is a
+#  fallback that re-runs from engineered CSVs if available, or
+#  returns an error asking for re-upload.)
+# ════════════════════════════════════════════════════════════════
+
+@app.post("/engineer-from-gridfs")
+def engineer_from_gridfs(req: EngineerFromGridFSRequest):
+    """
+    Re-runs engineering from engineered CSVs already in GridFS.
+    If engineered CSVs are in GridFS, just re-compute KPI stats.
+    """
+    try:
+        _ensure_gfs()
+        if not _GFS_AVAILABLE:
+            return {
+                "status":  "error",
+                "message": "GridFS not available. Please re-upload your datasets.",
+                "projectId": req.projectId,
+                "engineeredFiles": {}, "kpiSummary": {},
+            }
+
+        # Try to load engineered CSVs from GridFS
+        eco_key = _gfs_module.eco_csv_key(req.projectId)
+        mkt_key = _gfs_module.mkt_csv_key(req.projectId)
+        adv_key = _gfs_module.adv_csv_key(req.projectId)
+
+        for key, gfs_key in [("ecommerce", eco_key), ("marketing", mkt_key), ("advertising", adv_key)]:
+            if not _gfs_module.csv_exists(gfs_key):
+                return {
+                    "status":  "error",
+                    "message": (
+                        f"Engineered CSV for '{key}' not found in GridFS. "
+                        "Please re-upload your datasets to restart processing."
+                    ),
+                    "projectId": req.projectId,
+                    "engineeredFiles": {}, "kpiSummary": {},
+                }
+
+        # Load CSVs from GridFS into pandas
+        import io as _io
+        df_eco = pd.read_csv(_io.BytesIO(_gfs_module.load_csv(eco_key)), low_memory=False)
+        df_mkt = pd.read_csv(_io.BytesIO(_gfs_module.load_csv(mkt_key)), low_memory=False)
+        df_adv = pd.read_csv(_io.BytesIO(_gfs_module.load_csv(adv_key)), low_memory=False)
+
+        print(f"[EngineerGridFS] Loaded from GridFS: eco={len(df_eco)}, mkt={len(df_mkt)}, adv={len(df_adv)}")
+
+        # Re-compute KPI summary
+        def safe(val: Any) -> float:
+            if val is None: return 0.0
+            try:
+                v = float(val)
+                return 0.0 if (math.isnan(v) or math.isinf(v)) else round(v, 4)
+            except Exception: return 0.0
+
+        total_purchases  = int(df_eco["purchased"].sum()) if "purchased" in df_eco.columns else 0
+        total_visits     = len(df_eco)
+        total_cart_added = int(df_eco["added_to_cart"].sum()) if "added_to_cart" in df_eco.columns else 0
+        total_abandoned  = int(df_eco["cart_abandoned"].sum()) if "cart_abandoned" in df_eco.columns else 0
+
+        df_adv_valid = df_adv[df_adv["displays"] > 0] if "displays" in df_adv.columns else df_adv
+        avg_ctr  = safe(df_adv_valid["ctr"].mean() if "ctr" in df_adv_valid.columns else 0)
+        avg_conv = safe((total_purchases / total_visits * 100) if total_visits > 0 else 0)
+        avg_abandon = safe((total_abandoned / total_cart_added * 100) if total_cart_added > 0 else 0)
+
+        if "roi" in df_mkt.columns:
+            df_mkt_r = df_mkt.copy()
+            df_mkt_r["roi"] = pd.to_numeric(df_mkt_r["roi"], errors="coerce")
+            avg_roi = safe(df_mkt_r[df_mkt_r["roi"] > 0]["roi"].mean())
+        else:
+            avg_roi = 0.0
+
+        dataset_stats: Dict[str, Any] = {}
+        for feat in ECO_FEATURES:
+            if feat in df_eco.columns:
+                dataset_stats[feat] = _safe_stat_dict(df_eco[feat])
+
+        max_pages = float(pd.to_numeric(df_eco.get("pages_viewed", pd.Series([30])), errors="coerce").max() or 30.0)
+        max_time  = float(pd.to_numeric(df_eco.get("time_on_site_sec", pd.Series([1800])), errors="coerce").max() or 1800.0)
+        dataset_stats["_max_pages"] = max(max_pages, 1.0)
+        dataset_stats["_max_time"]  = max(max_time, 1.0)
+        dataset_stats["channel_conv_rates"]    = {}
+        dataset_stats["segment_conv_rates"]    = {}
+        dataset_stats["segment_abandon_rates"] = {}
+
+        kpi_summary = {
+            "avgCTR":             avg_ctr,
+            "avgConversionRate":  avg_conv,
+            "avgCartAbandonment": avg_abandon,
+            "avgROI":             avg_roi,
+            "totalRevenue":       safe(df_eco["revenue"].sum() if "revenue" in df_eco.columns else 0),
+            "totalClicks":        safe(df_adv["clicks"].sum()  if "clicks"  in df_adv.columns else 0),
+            "totalImpressions":   safe(df_adv["displays"].sum() if "displays" in df_adv.columns else 0),
+            "totalSessions":      total_visits,
+            "totalPurchases":     total_purchases,
+        }
+
+        engineered_files = {
+            "ecommerce":   f"engineered/{req.projectId}-ecommerce-engineered.csv",
+            "marketing":   f"engineered/{req.projectId}-marketing-engineered.csv",
+            "advertising": f"engineered/{req.projectId}-advertising-engineered.csv",
+        }
+
+        print(f"[EngineerGridFS] ✅ Done | KPIs: {kpi_summary}")
+
+        return {
+            "status":          "success",
+            "message":         "Feature engineering re-run from GridFS CSVs.",
+            "projectId":       req.projectId,
+            "engineeredFiles": engineered_files,
+            "kpiSummary":      kpi_summary,
+            "datasetStats":    dataset_stats,
+        }
+
+    except Exception as e:
+        _tb.print_exc()
+        return {
+            "status":  "error",
+            "message": f"{type(e).__name__}: {e}",
+            "projectId": req.projectId,
+            "engineeredFiles": {}, "kpiSummary": {},
         }
 
 
@@ -1075,16 +1585,81 @@ def train_models(req: TrainRequest):
         mkt_path = os.path.join(uploads_dir, req.marketingFile)
         adv_path = os.path.join(uploads_dir, req.advertisingFile)
 
-        for label, path in [
-            ("ecommerce", eco_path),
-            ("marketing",  mkt_path),
-            ("advertising", adv_path),
-        ]:
-            if not os.path.exists(path):
+        # ── FIX CROSS-CONTAINER: GridFS restore before disk check ─────────────
+        # On Render, Node (agentic-backend) and Python (agentic-uvicorn) run in
+        # SEPARATE containers with completely isolated /tmp filesystems.
+        # Files that Node saves to /tmp/uploads are NOT visible to Python's /tmp.
+        # Solution: Always attempt GridFS restore when disk files are missing.
+        missing_on_disk = [
+            (label, path_)
+            for label, path_ in [
+                ("ecommerce",   eco_path),
+                ("marketing",   mkt_path),
+                ("advertising", adv_path),
+            ]
+            if not os.path.exists(path_)
+        ]
+
+        if missing_on_disk:
+            print(
+                f"[Train] Files missing on disk: {[l for l,_ in missing_on_disk]} — "
+                f"attempting GridFS restore for {req.projectId}…"
+            )
+            _ensure_gfs()
+            if _GFS_AVAILABLE:
+                gfs_key_map = {
+                    "ecommerce":   _gfs_module.eco_csv_key(req.projectId),
+                    "marketing":   _gfs_module.mkt_csv_key(req.projectId),
+                    "advertising": _gfs_module.adv_csv_key(req.projectId),
+                }
+                path_map = {
+                    "ecommerce":   eco_path,
+                    "marketing":   mkt_path,
+                    "advertising": adv_path,
+                }
+                restored_ok = []
+                failed      = []
+                for label, _ in missing_on_disk:
+                    gfs_key   = gfs_key_map[label]
+                    disk_path = path_map[label]
+                    try:
+                        if _gfs_module.csv_exists(gfs_key):
+                            csv_bytes = _gfs_module.load_csv(gfs_key)
+                            os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+                            with open(disk_path, "wb") as _fh:
+                                _fh.write(csv_bytes)
+                            restored_ok.append(label)
+                            print(f"[Train] ✅ Restored {label} from GridFS ({round(len(csv_bytes)/1024,1)}KB)")
+                        else:
+                            failed.append(f"{label} (not in GridFS key={gfs_key})")
+                            print(f"[Train] ❌ {label}: not found in GridFS key={gfs_key}")
+                    except Exception as _re:
+                        failed.append(f"{label}: {_re}")
+                        print(f"[Train] ❌ {label} restore error: {_re}")
+
+                if failed:
+                    return {
+                        "status":  "error",
+                        "message": (
+                            f"Engineered CSV files are not on disk and could not be restored from GridFS: "
+                            f"{'; '.join(failed)}. "
+                            "This happens when the server restarts after a long idle period. "
+                            "Please re-upload your datasets to continue."
+                        ),
+                        "projectId":       req.projectId,
+                        "requiresReupload": True,
+                    }
+                print(f"[Train] ✅ GridFS restore complete: {restored_ok}")
+            else:
                 return {
-                    "status": "error",
-                    "message": f"File not found: {path}",
-                    "projectId": req.projectId,
+                    "status":  "error",
+                    "message": (
+                        "Engineered CSV files not found on disk and GridFS is not available. "
+                        f"Missing: {[l for l,_ in missing_on_disk]}. "
+                        "Please re-upload your datasets."
+                    ),
+                    "projectId":       req.projectId,
+                    "requiresReupload": True,
                 }
 
         df_eco = pd.read_csv(eco_path, low_memory=False)

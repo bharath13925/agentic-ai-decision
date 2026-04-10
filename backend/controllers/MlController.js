@@ -363,61 +363,17 @@ const trainModels = async (req, res) => {
       );
     }
 
-    // ── STEP 4: NO MATCH — run full training ──
+    // ── STEP 4: NO MATCH — run full training via GridFS ──
+    // FIX: On Render, Node and Python have separate /tmp filesystems.
+    // We no longer check local disk files or attempt GridFS CSV restore from Node.
+    // Instead, we tell Python to load CSVs directly from GridFS by projectId.
+    // Python's /train-models-from-gridfs endpoint handles restoration internally.
+
     if (!project.engineeredFiles?.ecommerce) {
       return res.status(400).json({
-        message: "Engineered files not found. Please re-upload your datasets.",
+        message: "Engineered files metadata not found in project. Please re-upload your datasets.",
         requiresReupload: true,
       });
-    }
-
-    const fsLib   = require("fs");
-    const pathLib = require("path");
-    const ecoFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.ecommerce);
-    const mktFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.marketing);
-    const advFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.advertising);
-
-    const missingDisk = [
-      !fsLib.existsSync(ecoFull) && `ecommerce: ${project.engineeredFiles.ecommerce}`,
-      !fsLib.existsSync(mktFull) && `marketing: ${project.engineeredFiles.marketing}`,
-      !fsLib.existsSync(advFull) && `advertising: ${project.engineeredFiles.advertising}`,
-    ].filter(Boolean);
-
-    if (missingDisk.length > 0) {
-      // ── FIX: Try to restore CSVs from GridFS before erroring ──
-      console.log(
-        `[ML:train] ⚠️  CSVs missing from disk — attempting GridFS restore: ${missingDisk.join(", ")}`
-      );
-      try {
-        const restoreRes = await axios.post(
-          `${PYTHON_URL}/restore-engineered-csvs`,
-          {
-            projectId:       projectId,
-            uploadsDir:      UPLOADS_DIR,
-            ecommerceFile:   project.engineeredFiles.ecommerce,
-            marketingFile:   project.engineeredFiles.marketing,
-            advertisingFile: project.engineeredFiles.advertising,
-          },
-          { timeout: 60000 }
-        );
-        if (restoreRes.data?.status !== "success") {
-          throw new Error(restoreRes.data?.message || "GridFS restore failed");
-        }
-        console.log(
-          `[ML:train] ✅ GridFS restore succeeded before training — ` +
-          `restored: ${JSON.stringify(restoreRes.data.restored)}`
-        );
-      } catch (restoreErr) {
-        console.error(`[ML:train] GridFS restore failed: ${restoreErr.message}`);
-        return res.status(400).json({
-          message:
-            "Engineered CSV files are missing on disk and could not be restored from GridFS. " +
-            "This happens when the server restarts after a long idle period. " +
-            "Please re-upload your datasets to continue. Missing: " + missingDisk.join(", "),
-          requiresReupload: true,
-          missingFiles:     missingDisk,
-        });
-      }
     }
 
     await Project.findByIdAndUpdate(project._id, { status: "engineered", errorMessage: null });
@@ -432,7 +388,7 @@ const trainModels = async (req, res) => {
 
     console.log(
       `[ML:train] Starting full training → projectId=${projectId} | objective=${objective} | ` +
-      `PKL→GridFS | CSV cleanup→DEFERRED (after compute-shap)`
+      `PKL→GridFS | CSV→loaded from GridFS by Python`
     );
 
     res.status(202).json({
@@ -646,16 +602,11 @@ const triggerAgentPipeline = async (
       }
     }
 
-    const fsLib   = require("fs");
-    const pathLib = require("path");
-    let ecommerceEngineerFile = project.engineeredFiles?.ecommerce || null;
-    if (ecommerceEngineerFile) {
-      const fullPath = pathLib.join(UPLOADS_DIR, ecommerceEngineerFile);
-      if (!fsLib.existsSync(fullPath)) {
-        console.log(`[AgentPipeline] Engineered CSV not on disk (already cleaned) — PKL scoring will use datasetStats medians`);
-        ecommerceEngineerFile = null;
-      }
-    }
+    // FIX: Do NOT check local disk for engineered CSV — on Render, Node and Python
+    // are separate containers. Pass null for ecommerceEngineerFile so Python uses
+    // dataset_stats medians for the base feature vector instead of reading a CSV file.
+    // Python will still work correctly via the dataset_stats medians.
+    const ecommerceEngineerFile = null;
 
     const payload = {
       projectId:        project.projectId,
@@ -747,90 +698,24 @@ const triggerAgentPipeline = async (
 
 /* ════════════════════════════════════════════════════════════════
    INTERNAL — ML Training trigger
-   FIX: callPythonWithRetry was called as (url, data, 6000000) — the 3rd arg
-   is `retries` not `timeout`. Fixed to (url, data, 2, 600000).
-   FIX CSV: Restore engineered CSVs from GridFS if /tmp was wiped (Render restart).
+   FIX: On Render, Node and Python run in separate containers with
+   isolated /tmp. We no longer check local disk files or attempt
+   GridFS restore from Node. Python's /train-models endpoint now
+   loads CSVs from GridFS by projectId directly.
 ════════════════════════════════════════════════════════════════ */
 const triggerMLTraining = async (project, mlResult, objective) => {
   try {
     console.log(
       `[ML:train] Starting → ${project.projectId} | Objective: ${objective} | ` +
-      `PKL→GridFS | CSV cleanup→DEFERRED (after compute-shap)`
+      `PKL→GridFS | CSV→Python loads from GridFS by projectId`
     );
 
-    const fsLib   = require("fs");
-    const pathLib = require("path");
-    const ecoFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.ecommerce);
-    const mktFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.marketing);
-    const advFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.advertising);
+    // FIX: Do NOT check local disk files or attempt disk-based restore.
+    // Node and Python are on separate Render containers with isolated /tmp.
+    // Python's /train-models endpoint will load engineered CSVs from GridFS
+    // using the projectId. We send projectId + file metadata so Python knows
+    // which GridFS keys to use.
 
-    // ── FIX: Restore CSVs from GridFS if missing from disk (Render /tmp wipe) ──
-    const missingDisk = [
-      !fsLib.existsSync(ecoFull),
-      !fsLib.existsSync(mktFull),
-      !fsLib.existsSync(advFull),
-    ].some(Boolean);
-
-    if (missingDisk) {
-      console.log(
-        `[ML:train] ⚠️  Engineered CSVs missing from disk — attempting GridFS restore…`
-      );
-      try {
-        const restoreRes = await axios.post(
-          `${PYTHON_URL}/restore-engineered-csvs`,
-          {
-            projectId:       project.projectId,
-            uploadsDir:      UPLOADS_DIR,
-            ecommerceFile:   project.engineeredFiles.ecommerce,
-            marketingFile:   project.engineeredFiles.marketing,
-            advertisingFile: project.engineeredFiles.advertising,
-          },
-          { timeout: 60000 }
-        );
-        if (restoreRes.data?.status === "success") {
-          console.log(
-            `[ML:train] ✅ GridFS restore succeeded — ` +
-            `restored: ${JSON.stringify(restoreRes.data.restored)}`
-          );
-        } else {
-          throw new Error(restoreRes.data?.message || "GridFS restore failed");
-        }
-      } catch (restoreErr) {
-        const errMsg =
-          "Engineered files missing on disk and could not be restored from GridFS. " +
-          "Please re-upload your datasets. Error: " + restoreErr.message;
-        console.error(`[ML:train] ❌ ${project.projectId}: ${errMsg}`);
-        await MLResult.findByIdAndUpdate(mlResult._id, { status: "error", errorMessage: errMsg });
-        await Project.findOneAndUpdate(
-          { projectId: project.projectId },
-          { status: "error", errorMessage: errMsg }
-        );
-        return;
-      }
-    }
-
-    // Verify files now exist on disk after potential restore
-    const stillMissing = [
-      !fsLib.existsSync(ecoFull) && ecoFull,
-      !fsLib.existsSync(mktFull) && mktFull,
-      !fsLib.existsSync(advFull) && advFull,
-    ].filter(Boolean);
-
-    if (stillMissing.length > 0) {
-      const errMsg =
-        "Engineered files still missing after GridFS restore attempt. " +
-        "Please re-upload your datasets. Missing: " + stillMissing.join(", ");
-      console.error(`[ML:train] ❌ ${project.projectId}: ${errMsg}`);
-      await MLResult.findByIdAndUpdate(mlResult._id, { status: "error", errorMessage: errMsg });
-      await Project.findOneAndUpdate(
-        { projectId: project.projectId },
-        { status: "error", errorMessage: `ML training failed: ${errMsg.slice(0, 300)}` }
-      );
-      return;
-    }
-
-    // FIX: was callPythonWithRetry(url, data, 6000000) — 3rd arg is retries not timeout.
-    // Correct call: (url, data, retries=2, timeout=600000)
     const response = await callPythonWithRetry(
       `${PYTHON_URL}/train-models`,
       {
@@ -838,10 +723,14 @@ const triggerMLTraining = async (project, mlResult, objective) => {
         mongoId:         project._id.toString(),
         mlResultId:      mlResult._id.toString(),
         uploadsDir:      UPLOADS_DIR,
-        ecommerceFile:   project.engineeredFiles.ecommerce,
-        marketingFile:   project.engineeredFiles.marketing,
-        advertisingFile: project.engineeredFiles.advertising,
+        // Send file references so Python can locate them in GridFS
+        // Python will try GridFS first, then fall back to disk paths
+        ecommerceFile:   project.engineeredFiles?.ecommerce   || `engineered/${project.projectId}-ecommerce-engineered.csv`,
+        marketingFile:   project.engineeredFiles?.marketing   || `engineered/${project.projectId}-marketing-engineered.csv`,
+        advertisingFile: project.engineeredFiles?.advertising || `engineered/${project.projectId}-advertising-engineered.csv`,
         objective,
+        // Tell Python to load from GridFS if disk files are missing
+        useGridFsFallback: true,
       },
       2,
       600000,
@@ -876,8 +765,7 @@ const triggerMLTraining = async (project, mlResult, objective) => {
       console.log(
         `[ML:train] ✅ Done → ${project.projectId} | ` +
         `Ensemble=${d.ensemble.avgAccuracy}% | PKL→GridFS | objective=${objective} | ` +
-        `fingerprint=${mlResult.datasetFingerprint?.slice(0, 12)}… | ` +
-        `CSVs retained on disk (will be deleted after compute-shap)`
+        `fingerprint=${mlResult.datasetFingerprint?.slice(0, 12)}…`
       );
     } else {
       const errMsg = response.data?.message || "Training failed.";

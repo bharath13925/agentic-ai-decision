@@ -7,16 +7,12 @@ const UserAction = require("../models/UserAction");
 
 const PYTHON_URL  = process.env.PYTHON_URL  || "http://localhost:8000";
 
-// Resolve UPLOADS_DIR to an absolute path at module load time.
 const UPLOADS_DIR = process.env.UPLOADS_DIR
   ? path.resolve(process.env.UPLOADS_DIR)
   : path.join(__dirname, "../uploads");
 
 console.log(`[ProjectController] UPLOADS_DIR resolved → ${UPLOADS_DIR}`);
 
-/* ════════════════════════════════════════════════════════════════
-   Retry wrapper for Python microservice calls
-════════════════════════════════════════════════════════════════ */
 async function callPythonWithRetry(url, data, retries = 2, timeout = 120000) {
   try {
     return await axios.post(url, data, { timeout });
@@ -29,9 +25,6 @@ async function callPythonWithRetry(url, data, retries = 2, timeout = 120000) {
   }
 }
 
-/* ════════════════════════════════════════════════════════════════
-   HELPER — SHA-256 file hash (for dedup)
-════════════════════════════════════════════════════════════════ */
 const hashFile = (filePath) =>
   new Promise((resolve, reject) => {
     const hash   = crypto.createHash("sha256");
@@ -41,9 +34,6 @@ const hashFile = (filePath) =>
     stream.on("error", reject);
   });
 
-/* ════════════════════════════════════════════════════════════════
-   HELPER — safely delete a file if it exists (no-op otherwise)
-════════════════════════════════════════════════════════════════ */
 const safeDelete = (filePath) => {
   if (filePath && fs.existsSync(filePath)) {
     try {
@@ -57,6 +47,9 @@ const safeDelete = (filePath) => {
 
 /* ════════════════════════════════════════════════════════════════
    POST /api/projects/upload
+   FIX: Sends file CONTENTS as base64 to Python /process-datasets.
+   This works correctly across separate Render containers where
+   /tmp is NOT shared between Node and Python services.
 ════════════════════════════════════════════════════════════════ */
 const uploadDatasets = async (req, res) => {
   try {
@@ -71,6 +64,12 @@ const uploadDatasets = async (req, res) => {
     const ecoPath = path.join(UPLOADS_DIR, files.ecommerce[0].filename);
     const mktPath = path.join(UPLOADS_DIR, files.marketing[0].filename);
     const advPath = path.join(UPLOADS_DIR, files.advertising[0].filename);
+
+    if (!fs.existsSync(ecoPath) || !fs.existsSync(mktPath) || !fs.existsSync(advPath)) {
+      return res.status(500).json({
+        message: "Uploaded files could not be saved. Please try again.",
+      });
+    }
 
     const [hashEco, hashMkt, hashAdv] = await Promise.all([
       hashFile(ecoPath), hashFile(mktPath), hashFile(advPath),
@@ -89,20 +88,15 @@ const uploadDatasets = async (req, res) => {
     const isPostTraining = existing &&
       ["ml_complete", "complete"].includes(existing.status);
 
-    const isEngineeredOnDisk = existing &&
-      existing.engineeredFiles?.ecommerce &&
-      fs.existsSync(path.join(UPLOADS_DIR, existing.engineeredFiles.ecommerce));
-
     const hasValidKpi = existing &&
       existing.kpiSummary &&
       existing.kpiSummary.avgConversionRate > 0;
 
-    const dedupValid = hasValidKpi && (isPostTraining || isEngineeredOnDisk);
+    const dedupValid = hasValidKpi && existing;
 
     if (dedupValid) {
       console.log(`[Upload] Dedup hit → reusing processed data from ${existing.projectId} (status: ${existing.status})`);
 
-      // Delete the newly uploaded raw files — we don't need them
       safeDelete(ecoPath);
       safeDelete(mktPath);
       safeDelete(advPath);
@@ -121,7 +115,6 @@ const uploadDatasets = async (req, res) => {
         kpiSummary:      existing.kpiSummary,
         datasetStats:    existing.datasetStats || null,
         status:               isPostTraining ? existing.status : "engineered",
-        // FIX: field name is reusedsDatasets on the model (preserved for DB compat)
         reusedsDatasets:      true,
         reusedFromProjectId:  existing.projectId,
       });
@@ -131,7 +124,6 @@ const uploadDatasets = async (req, res) => {
         projectId:      project.projectId,
         projectName:    project.projectName,
         status:         project.status,
-        // FIX: response key uses reusedDatasets (camelCase, no typo) for frontend
         reusedDatasets: true,
         kpiSummary:     project.kpiSummary,
         project: {
@@ -141,14 +133,6 @@ const uploadDatasets = async (req, res) => {
           kpiSummary:  project.kpiSummary,
         },
       });
-    }
-
-    if (existing && !dedupValid) {
-      console.warn(
-        `[Upload] Dedup hit for ${existing.projectId} but cannot reuse — ` +
-        `kpiValid=${hasValidKpi} postTraining=${isPostTraining} diskOk=${isEngineeredOnDisk} ` +
-        `falling through to fresh processing.`
-      );
     }
 
     const project = await Project.create({
@@ -165,12 +149,8 @@ const uploadDatasets = async (req, res) => {
 
     console.log(`[Upload] New project created → ${project.projectId}`);
 
-    triggerPythonCleaning(project).catch((err) =>
-      console.error(`[Python:clean] ${project.projectId} — ${err.message}`)
-    );
-
-    return res.status(201).json({
-      message:        "Datasets uploaded. Cleaning started.",
+    res.status(201).json({
+      message:        "Datasets uploaded. Processing started.",
       projectId:      project.projectId,
       projectName:    project.projectName,
       status:         project.status,
@@ -182,6 +162,12 @@ const uploadDatasets = async (req, res) => {
         kpiSummary:  null,
       },
     });
+
+    // FIX: Read file contents and send as base64 to Python.
+    // This works across separate Render containers where /tmp is NOT shared.
+    triggerPythonProcessing(project, ecoPath, mktPath, advPath).catch((err) =>
+      console.error(`[Python:process] ${project.projectId} — ${err.message}`)
+    );
   } catch (err) {
     console.error("uploadDatasets:", err.message);
     return res.status(500).json({ message: "Server error.", error: err.message });
@@ -201,8 +187,8 @@ const resumeProject = async (req, res) => {
     console.log(`[Resume] projectId=${projectId} | status=${project.status}`);
 
     if (project.status === "cleaned") {
-      console.log(`[Resume] ${projectId} stuck at 'cleaned' — re-triggering feature engineering.`);
-      triggerFeatureEngineering(project).catch((err) =>
+      console.log(`[Resume] ${projectId} stuck at 'cleaned' — re-triggering feature engineering via GridFS restore.`);
+      triggerFeatureEngineeringFromGridFS(project).catch((err) =>
         console.error(`[Resume:engineer] ${projectId} — ${err.message}`)
       );
     }
@@ -387,10 +373,8 @@ const runFeatureEngineering = async (req, res) => {
       return res.status(400).json({
         message: `Cannot run feature engineering. Current status: "${project.status}".`,
       });
-    if (!project.cleanedFiles?.ecommerce)
-      return res.status(400).json({ message: "Cleaned files not found. Re-upload datasets." });
 
-    triggerFeatureEngineering(project).catch((err) =>
+    triggerFeatureEngineeringFromGridFS(project).catch((err) =>
       console.error(`[engineer] ${projectId} — ${err.message}`)
     );
     return res.status(200).json({ message: "Feature engineering started.", projectId });
@@ -415,66 +399,88 @@ const getUserProjects = async (req, res) => {
 };
 
 /* ════════════════════════════════════════════════════════════════
-   INTERNAL — Python cleaning pipeline
+   INTERNAL — Main processing pipeline
+   FIX: Reads file contents from Node's local disk (where multer
+   saved them), encodes as base64, sends to Python /process-datasets.
+   Python decodes, processes in ITS OWN /tmp, saves to GridFS.
+   This is the ONLY cross-container-safe approach on Render.
 ════════════════════════════════════════════════════════════════ */
-const triggerPythonCleaning = async (project) => {
+const triggerPythonProcessing = async (project, ecoPath, mktPath, advPath) => {
   try {
-    const ecoPath = path.join(UPLOADS_DIR, project.files.ecommerce);
-    const mktPath = path.join(UPLOADS_DIR, project.files.marketing);
-    const advPath = path.join(UPLOADS_DIR, project.files.advertising);
-
     if (!fs.existsSync(ecoPath) || !fs.existsSync(mktPath) || !fs.existsSync(advPath)) {
       await Project.findByIdAndUpdate(project._id, {
         status:       "error",
-        errorMessage: "Uploaded files not found on disk. Please re-upload.",
+        errorMessage: "Uploaded files not found on disk after multer save.",
       });
       return;
     }
 
+    // Read file contents from Node's local disk
+    const ecoContent = fs.readFileSync(ecoPath).toString("base64");
+    const mktContent = fs.readFileSync(mktPath).toString("base64");
+    const advContent = fs.readFileSync(advPath).toString("base64");
+
+    // Delete from Node's disk immediately after reading
+    safeDelete(ecoPath);
+    safeDelete(mktPath);
+    safeDelete(advPath);
+
     await Project.findByIdAndUpdate(project._id, { status: "cleaning" });
 
+    console.log(`[Python:process] Sending file contents as base64 to Python for ${project.projectId}`);
+
+    // FIX: Use /process-datasets which accepts base64 content.
+    // Python writes to ITS OWN /tmp and saves engineered CSVs to GridFS.
     const response = await callPythonWithRetry(
-      `${PYTHON_URL}/clean-datasets`,
+      `${PYTHON_URL}/process-datasets`,
       {
-        projectId:       project.projectId,
-        mongoId:         project._id.toString(),
-        uploadsDir:      UPLOADS_DIR,
-        ecommerceFile:   project.files.ecommerce,
-        marketingFile:   project.files.marketing,
-        advertisingFile: project.files.advertising,
+        projectId:            project.projectId,
+        mongoId:              project._id.toString(),
+        ecommerceContent:     ecoContent,
+        marketingContent:     mktContent,
+        advertisingContent:   advContent,
+        ecommerceFilename:    project.files.ecommerce,
+        marketingFilename:    project.files.marketing,
+        advertisingFilename:  project.files.advertising,
       },
       2,
-      120000,
+      300000, // 5 minutes
     );
 
     if (response.data?.status === "success") {
-      await Project.findByIdAndUpdate(project._id, {
-        status:       "cleaned",
-        cleanedFiles: {
-          ecommerce:   response.data.cleanedFiles.ecommerce,
-          marketing:   response.data.cleanedFiles.marketing,
-          advertising: response.data.cleanedFiles.advertising,
+      const updatePayload = {
+        status:          "engineered",
+        cleanedFiles:    response.data.cleanedFiles    || null,
+        engineeredFiles: response.data.engineeredFiles || {
+          ecommerce:   `engineered/${project.projectId}-ecommerce-engineered.csv`,
+          marketing:   `engineered/${project.projectId}-marketing-engineered.csv`,
+          advertising: `engineered/${project.projectId}-advertising-engineered.csv`,
         },
-      });
+        kpiSummary: response.data.kpiSummary,
+      };
 
-      // Delete raw uploaded files now that cleaned versions exist
-      safeDelete(path.join(UPLOADS_DIR, project.files.ecommerce));
-      safeDelete(path.join(UPLOADS_DIR, project.files.marketing));
-      safeDelete(path.join(UPLOADS_DIR, project.files.advertising));
+      if (response.data.datasetStats && Object.keys(response.data.datasetStats).length > 0) {
+        updatePayload.datasetStats = response.data.datasetStats;
+        console.log(`[Python:process] datasetStats stored for ${project.projectId}`);
+      }
 
-      const fresh = await Project.findById(project._id);
-      await triggerFeatureEngineering(fresh);
+      await Project.findByIdAndUpdate(project._id, updatePayload);
+
+      console.log(
+        `[Python:process] ✅ Done → ${project.projectId} | ` +
+        `KPIs: ${JSON.stringify(response.data.kpiSummary)}`
+      );
     } else {
-      const errMsg = response.data?.message || "Cleaning failed.";
-      console.error(`[Python:clean] ❌ ${project.projectId}: ${errMsg}`);
+      const errMsg = response.data?.message || "Processing failed.";
+      console.error(`[Python:process] ❌ ${project.projectId}: ${errMsg.slice(0, 500)}`);
       await Project.findByIdAndUpdate(project._id, {
         status:       "error",
-        errorMessage: errMsg,
+        errorMessage: errMsg.slice(0, 400),
       });
     }
   } catch (err) {
-    const errMsg = `Cleaning exception: ${err.message}`;
-    console.error(`[Python:clean] ❌ ${project.projectId}: ${errMsg}`);
+    const errMsg = `Processing exception: ${err.message}`;
+    console.error(`[Python:process] ❌ ${project.projectId}: ${errMsg}`);
     await Project.findByIdAndUpdate(project._id, {
       status:       "error",
       errorMessage: errMsg,
@@ -483,73 +489,41 @@ const triggerPythonCleaning = async (project) => {
 };
 
 /* ════════════════════════════════════════════════════════════════
-   INTERNAL — Feature engineering
+   INTERNAL — Feature engineering from GridFS (for resume/retry)
 ════════════════════════════════════════════════════════════════ */
-const triggerFeatureEngineering = async (project) => {
+const triggerFeatureEngineeringFromGridFS = async (project) => {
   try {
-    if (!project.cleanedFiles?.ecommerce)
-      throw new Error("cleanedFiles missing.");
-
     await Project.findByIdAndUpdate(project._id, { status: "engineering" });
 
     const response = await callPythonWithRetry(
-      `${PYTHON_URL}/engineer-features`,
+      `${PYTHON_URL}/engineer-from-gridfs`,
       {
-        projectId:       project.projectId,
-        mongoId:         project._id.toString(),
-        uploadsDir:      UPLOADS_DIR,
-        ecommerceFile:   project.cleanedFiles.ecommerce,
-        marketingFile:   project.cleanedFiles.marketing,
-        advertisingFile: project.cleanedFiles.advertising,
+        projectId: project.projectId,
+        mongoId:   project._id.toString(),
       },
       2,
-      120000,
+      180000,
     );
 
     if (response.data?.status === "success") {
       const updatePayload = {
         status:          "engineered",
-        engineeredFiles: {
-          ecommerce:   response.data.engineeredFiles.ecommerce,
-          marketing:   response.data.engineeredFiles.marketing,
-          advertising: response.data.engineeredFiles.advertising,
+        engineeredFiles: response.data.engineeredFiles || {
+          ecommerce:   `engineered/${project.projectId}-ecommerce-engineered.csv`,
+          marketing:   `engineered/${project.projectId}-marketing-engineered.csv`,
+          advertising: `engineered/${project.projectId}-advertising-engineered.csv`,
         },
         kpiSummary: response.data.kpiSummary,
       };
 
-      if (
-        response.data.datasetStats &&
-        Object.keys(response.data.datasetStats).length > 0
-      ) {
+      if (response.data.datasetStats && Object.keys(response.data.datasetStats).length > 0) {
         updatePayload.datasetStats = response.data.datasetStats;
-        console.log(
-          `[Python:engineer] datasetStats stored for ${project.projectId} | ` +
-          `max_pages=${response.data.datasetStats._max_pages} | ` +
-          `max_time=${response.data.datasetStats._max_time}`
-        );
-      } else {
-        console.warn(
-          `[Python:engineer] ⚠️  No datasetStats returned for ${project.projectId}. ` +
-          `Simulation agent will use safe defaults.`
-        );
       }
 
       await Project.findByIdAndUpdate(project._id, updatePayload);
-
-      // Delete cleaned files now that engineered files exist.
-      if (project.cleanedFiles) {
-        safeDelete(path.join(UPLOADS_DIR, project.cleanedFiles.ecommerce || ""));
-        safeDelete(path.join(UPLOADS_DIR, project.cleanedFiles.marketing || ""));
-        safeDelete(path.join(UPLOADS_DIR, project.cleanedFiles.advertising || ""));
-      }
-
-      console.log(
-        `[Python:engineer] Done → ${project.projectId} | ` +
-        `KPIs: ${JSON.stringify(response.data.kpiSummary)}`
-      );
+      console.log(`[Python:engineer-gridfs] ✅ Done → ${project.projectId}`);
     } else {
-      const errMsg = response.data?.message || "Feature engineering failed.";
-      console.error(`[Python:engineer] ❌ ${project.projectId}: ${errMsg.slice(0, 500)}`);
+      const errMsg = response.data?.message || "Feature engineering from GridFS failed.";
       await Project.findByIdAndUpdate(project._id, {
         status:       "error",
         errorMessage: errMsg.slice(0, 400),
@@ -557,7 +531,6 @@ const triggerFeatureEngineering = async (project) => {
     }
   } catch (err) {
     const errMsg = `Feature engineering exception: ${err.message}`;
-    console.error(`[Python:engineer] ❌ ${project.projectId}: ${errMsg}`);
     await Project.findByIdAndUpdate(project._id, {
       status:       "error",
       errorMessage: errMsg,
@@ -569,8 +542,6 @@ const triggerFeatureEngineering = async (project) => {
    HELPERS
 ════════════════════════════════════════════════════════════════ */
 const getAllowedStep = (status, latestObjective, latestSimMode) => {
-  // FIX: "analyzing" status means ML training is running — user is on step 4,
-  // not step 1. Previously returned 1 for any non-engineered status.
   const PRE_STEP2 = ["uploaded", "cleaning", "cleaned", "engineering", "error"];
   if (PRE_STEP2.includes(status)) return 1;
   if (!["engineered", "analyzing", "ml_complete", "complete"].includes(status)) return 1;
