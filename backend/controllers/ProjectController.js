@@ -46,6 +46,37 @@ const safeDelete = (filePath) => {
 };
 
 /* ════════════════════════════════════════════════════════════════
+   FIX: Copy GridFS CSVs from source project to new project.
+   Called after a dedup hit so the new projectId has its own CSV
+   keys in GridFS — required for ML training to find the files.
+
+   This is a fire-and-forget call (non-blocking, non-fatal).
+════════════════════════════════════════════════════════════════ */
+const _triggerCsvCopyToNewProject = async (sourceProjectId, newProjectId) => {
+  try {
+    console.log(`[CSV:copy] Copying GridFS CSVs from ${sourceProjectId} → ${newProjectId}…`);
+    const res = await axios.post(
+      `${PYTHON_URL}/copy-project-csvs`,
+      { sourceProjectId, newProjectId },
+      { timeout: 30000 },
+    );
+    if (res.data?.status === "success") {
+      console.log(
+        `[CSV:copy] ✅ Done: ${sourceProjectId} → ${newProjectId} | ` +
+        `results=${JSON.stringify(res.data.results)}`
+      );
+    } else {
+      console.warn(
+        `[CSV:copy] ⚠️  Non-success: ${JSON.stringify(res.data?.message)}`
+      );
+    }
+  } catch (e) {
+    // Non-fatal — ML training will fall back to source project CSVs in MlController
+    console.warn(`[CSV:copy] ⚠️  Failed (non-fatal): ${e.message}`);
+  }
+};
+
+/* ════════════════════════════════════════════════════════════════
    POST /api/projects/upload
    FIX: Sends file CONTENTS as base64 to Python /process-datasets.
    This works correctly across separate Render containers where
@@ -118,6 +149,12 @@ const uploadDatasets = async (req, res) => {
         reusedsDatasets:      true,
         reusedFromProjectId:  existing.projectId,
       });
+
+      // FIX: Copy GridFS CSVs from source project to new project so that
+      // ML training with a different objective can find the files under
+      // the new projectId's GridFS keys.
+      // This is fire-and-forget — failure is non-fatal (MlController has fallback).
+      _triggerCsvCopyToNewProject(existing.projectId, project.projectId).catch(() => {});
 
       return res.status(201).json({
         message:        "Datasets recognised — reusing previously processed files. Ready to select objective.",
@@ -400,10 +437,6 @@ const getUserProjects = async (req, res) => {
 
 /* ════════════════════════════════════════════════════════════════
    INTERNAL — Main processing pipeline
-   FIX: Reads file contents from Node's local disk (where multer
-   saved them), encodes as base64, sends to Python /process-datasets.
-   Python decodes, processes in ITS OWN /tmp, saves to GridFS.
-   This is the ONLY cross-container-safe approach on Render.
 ════════════════════════════════════════════════════════════════ */
 const triggerPythonProcessing = async (project, ecoPath, mktPath, advPath) => {
   try {
@@ -429,8 +462,6 @@ const triggerPythonProcessing = async (project, ecoPath, mktPath, advPath) => {
 
     console.log(`[Python:process] Sending file contents as base64 to Python for ${project.projectId}`);
 
-    // FIX: Use /process-datasets which accepts base64 content.
-    // Python writes to ITS OWN /tmp and saves engineered CSVs to GridFS.
     const response = await callPythonWithRetry(
       `${PYTHON_URL}/process-datasets`,
       {
@@ -444,7 +475,7 @@ const triggerPythonProcessing = async (project, ecoPath, mktPath, advPath) => {
         advertisingFilename:  project.files.advertising,
       },
       2,
-      300000, // 5 minutes
+      300000,
     );
 
     if (response.data?.status === "success") {

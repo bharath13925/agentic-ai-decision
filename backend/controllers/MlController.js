@@ -210,7 +210,7 @@ const trainModels = async (req, res) => {
 
     const objective = latestObjective.objective;
 
-    // ── STEP 1: Check if THIS project already has a complete MLResult ──
+    // ── STEP 1: Check if THIS project already has a complete MLResult for this objective ──
     const ownComplete = await findExistingCompleteMLResult(projectId, objective);
     if (ownComplete) {
       console.log(
@@ -280,8 +280,8 @@ const trainModels = async (req, res) => {
         });
       }
       console.log(
-        `[ML:train] Source project ${project.reusedFromProjectId} has no MLResult ` +
-        `for objective="${objective}" — checking fingerprint reuse or retraining`
+        `[ML:train] Source project ${project.reusedFromProjectId} has NO trained models ` +
+        `for objective="${objective}" — this is a NEW objective, full training required.`
       );
     }
 
@@ -363,11 +363,11 @@ const trainModels = async (req, res) => {
       );
     }
 
-    // ── STEP 4: NO MATCH — run full training via GridFS ──
+    // ── STEP 4: NO MATCH — run full training ──
     // FIX: On Render, Node and Python have separate /tmp filesystems.
-    // We no longer check local disk files or attempt GridFS CSV restore from Node.
-    // Instead, we tell Python to load CSVs directly from GridFS by projectId.
-    // Python's /train-models-from-gridfs endpoint handles restoration internally.
+    // Python's /train-models endpoint handles CSV restoration from GridFS.
+    // We also pass the sourceProjectId so Python can fall back to copying
+    // from that project's GridFS CSV keys if the new project's keys don't exist yet.
 
     if (!project.engineeredFiles?.ecommerce) {
       return res.status(400).json({
@@ -602,10 +602,6 @@ const triggerAgentPipeline = async (
       }
     }
 
-    // FIX: Do NOT check local disk for engineered CSV — on Render, Node and Python
-    // are separate containers. Pass null for ecommerceEngineerFile so Python uses
-    // dataset_stats medians for the base feature vector instead of reading a CSV file.
-    // Python will still work correctly via the dataset_stats medians.
     const ecommerceEngineerFile = null;
 
     const payload = {
@@ -698,10 +694,11 @@ const triggerAgentPipeline = async (
 
 /* ════════════════════════════════════════════════════════════════
    INTERNAL — ML Training trigger
-   FIX: On Render, Node and Python run in separate containers with
-   isolated /tmp. We no longer check local disk files or attempt
-   GridFS restore from Node. Python's /train-models endpoint now
-   loads CSVs from GridFS by projectId directly.
+
+   FIX: When datasets are reused with a DIFFERENT objective, the new
+   project's GridFS CSV keys may not exist yet (copy happens async
+   after dedup). We pass reusedFromProjectId so Python can fall back
+   to copying from the source project's GridFS keys if needed.
 ════════════════════════════════════════════════════════════════ */
 const triggerMLTraining = async (project, mlResult, objective) => {
   try {
@@ -710,12 +707,6 @@ const triggerMLTraining = async (project, mlResult, objective) => {
       `PKL→GridFS | CSV→Python loads from GridFS by projectId`
     );
 
-    // FIX: Do NOT check local disk files or attempt disk-based restore.
-    // Node and Python are on separate Render containers with isolated /tmp.
-    // Python's /train-models endpoint will load engineered CSVs from GridFS
-    // using the projectId. We send projectId + file metadata so Python knows
-    // which GridFS keys to use.
-
     const response = await callPythonWithRetry(
       `${PYTHON_URL}/train-models`,
       {
@@ -723,14 +714,14 @@ const triggerMLTraining = async (project, mlResult, objective) => {
         mongoId:         project._id.toString(),
         mlResultId:      mlResult._id.toString(),
         uploadsDir:      UPLOADS_DIR,
-        // Send file references so Python can locate them in GridFS
-        // Python will try GridFS first, then fall back to disk paths
         ecommerceFile:   project.engineeredFiles?.ecommerce   || `engineered/${project.projectId}-ecommerce-engineered.csv`,
         marketingFile:   project.engineeredFiles?.marketing   || `engineered/${project.projectId}-marketing-engineered.csv`,
         advertisingFile: project.engineeredFiles?.advertising || `engineered/${project.projectId}-advertising-engineered.csv`,
         objective,
-        // Tell Python to load from GridFS if disk files are missing
         useGridFsFallback: true,
+        // FIX: pass source project ID so Python can copy CSVs if the new
+        // project's GridFS keys don't exist yet (different objective scenario)
+        reusedFromProjectId: project.reusedsDatasets ? (project.reusedFromProjectId || null) : null,
       },
       2,
       600000,

@@ -1,5 +1,12 @@
 """
-AgenticIQ — GridFS Storage Helper v5.0
+AgenticIQ — GridFS Storage Helper v5.1
+
+CHANGES v5.1:
+  - Added copy_csv(src_key, dst_key) to copy engineered CSVs between projects.
+    Used when a new project reuses datasets from an existing project — the
+    source project's GridFS CSVs are copied to the new project's keys so
+    ML training works correctly regardless of which projectId is used.
+  - Added copy_all_project_csvs(src_pid, dst_pid) convenience helper.
 
 CHANGES v5.0:
   - Added save_csv() / load_csv() / csv_exists() / delete_csv() / list_project_csvs()
@@ -131,23 +138,11 @@ def list_project_pkls(project_id: str) -> list:
 
 # ════════════════════════════════════════════════════════════════
 #  JSON HELPERS (RAG documents)
-#  NEW in v4.0 — stores RAG doc chunks as JSON blobs in GridFS.
-#  This replaces disk-based FAISS .faiss / .pkl persistence.
-#  FAISS is rebuilt in-memory at query time from these JSON docs.
 # ════════════════════════════════════════════════════════════════
 
 def save_json(obj, filename: str, metadata: dict = None) -> str:
-    """
-    Serialize obj as UTF-8 JSON and store in GridFS.
-    Replaces any existing file with the same filename.
-    Returns the filename (GridFS key).
-
-    Use for RAG document chunks, config blobs, etc.
-    obj must be JSON-serialisable (list / dict of primitives).
-    """
     fs = _get_fs()
 
-    # Delete old versions first
     for old in list(fs.find({"filename": filename})):
         fs.delete(old._id)
 
@@ -164,11 +159,6 @@ def save_json(obj, filename: str, metadata: dict = None) -> str:
 
 
 def load_json(filename: str):
-    """
-    Load and deserialise a JSON blob from GridFS.
-    Raises FileNotFoundError if the key does not exist.
-    Returns the original Python object (list / dict).
-    """
     fs = _get_fs()
     if not fs.exists({"filename": filename}):
         raise FileNotFoundError(
@@ -181,7 +171,6 @@ def load_json(filename: str):
 
 
 def json_exists(filename: str) -> bool:
-    """Check if a JSON blob exists in GridFS. Returns False on any error."""
     if not filename:
         return False
     try:
@@ -192,7 +181,6 @@ def json_exists(filename: str) -> bool:
 
 
 def delete_json(filename: str):
-    """Delete all versions of a JSON blob from GridFS."""
     fs    = _get_fs()
     count = 0
     for f in list(fs.find({"filename": filename})):
@@ -202,16 +190,7 @@ def delete_json(filename: str):
 
 
 # ════════════════════════════════════════════════════════════════
-#  CSV HELPERS (Engineered datasets) — NEW v5.0
-#
-#  After /engineer-features, each engineered CSV is saved here.
-#  Before /train-models, if disk files are missing, they are
-#  restored from GridFS automatically.
-#
-#  Key naming:
-#    {projectId}/csvs/ecommerce-engineered.csv
-#    {projectId}/csvs/marketing-engineered.csv
-#    {projectId}/csvs/advertising-engineered.csv
+#  CSV HELPERS (Engineered datasets) — v5.0+
 # ════════════════════════════════════════════════════════════════
 
 def save_csv(csv_bytes: bytes, filename: str, metadata: dict = None) -> str:
@@ -261,6 +240,53 @@ def delete_csv(filename: str):
     print(f"[GridFS] Deleted CSV: {filename} ({count} version(s))")
 
 
+def copy_csv(src_key: str, dst_key: str, metadata: dict = None) -> bool:
+    """
+    Copy a CSV from src_key to dst_key in GridFS.
+    Used when a new project reuses datasets from a source project —
+    the source project's engineered CSVs are copied to the new project's
+    GridFS keys so ML training works correctly with the new projectId.
+
+    Returns True if copy succeeded, False if src_key not found or error.
+    """
+    fs = _get_fs()
+    if not fs.exists({"filename": src_key}):
+        print(f"[GridFS] copy_csv: source '{src_key}' not found — cannot copy")
+        return False
+    try:
+        data = fs.get_last_version(src_key).read()
+        # Remove existing dst
+        for old in list(fs.find({"filename": dst_key})):
+            fs.delete(old._id)
+        fs.put(data, filename=dst_key, content_type="text/csv",
+               metadata=metadata or {})
+        size_kb = round(len(data) / 1024, 1)
+        print(f"[GridFS] ✅ Copied CSV: {src_key} → {dst_key} | {size_kb}KB")
+        return True
+    except Exception as e:
+        print(f"[GridFS] ❌ copy_csv failed {src_key} → {dst_key}: {e}")
+        return False
+
+
+def copy_all_project_csvs(src_pid: str, dst_pid: str) -> dict:
+    """
+    Copy all three engineered CSVs from src_pid to dst_pid in GridFS.
+    Returns a dict with keys 'ecommerce', 'marketing', 'advertising'
+    mapped to True/False indicating success per file.
+    """
+    results = {}
+    for key_fn, label in [
+        (eco_csv_key, "ecommerce"),
+        (mkt_csv_key, "marketing"),
+        (adv_csv_key, "advertising"),
+    ]:
+        src = key_fn(src_pid)
+        dst = key_fn(dst_pid)
+        results[label] = copy_csv(src, dst, metadata={"projectId": dst_pid, "type": label, "copiedFrom": src_pid})
+    print(f"[GridFS] copy_all_project_csvs: {src_pid} → {dst_pid} | results={results}")
+    return results
+
+
 def list_project_csvs(project_id: str) -> list:
     """List all CSV filenames stored for a project."""
     import re as _re
@@ -282,7 +308,7 @@ def kpi_key(pid: str)      -> str: return f"{pid}/models/kpi_predictor.pkl"
 # RAG JSON key
 def rag_docs_key(pid: str) -> str: return f"{pid}/rag/docs.json"
 
-# CSV keys — NEW v5.0
+# CSV keys — v5.0+
 def eco_csv_key(pid: str)  -> str: return f"{pid}/csvs/ecommerce-engineered.csv"
 def mkt_csv_key(pid: str)  -> str: return f"{pid}/csvs/marketing-engineered.csv"
 def adv_csv_key(pid: str)  -> str: return f"{pid}/csvs/advertising-engineered.csv"

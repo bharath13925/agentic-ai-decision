@@ -293,8 +293,9 @@ class TrainRequest(BaseModel):
     ecommerceFile:      str
     marketingFile:      str
     advertisingFile:    str
-    objective:          str
-    useGridFsFallback:  Optional[bool] = True  # always try GridFS if disk files missing
+    objective:           str
+    useGridFsFallback:   Optional[bool] = True   # always try GridFS if disk files missing
+    reusedFromProjectId: Optional[str]  = None   # FIX: source project for CSV fallback
 
 
 class ScoreStrategiesRequest(BaseModel):
@@ -369,6 +370,11 @@ class RagQueryRequest(BaseModel):
     query:     str
     model:     Optional[str] = None
     topK:      Optional[int] = 4
+
+
+class CopyProjectCsvsRequest(BaseModel):
+    sourceProjectId: str
+    newProjectId:    str
 
 
 class DeleteProjectCsvsRequest(BaseModel):
@@ -469,6 +475,50 @@ def rag_clear_endpoint(project_id: str):
 # ════════════════════════════════════════════════════════════════
 #  FIX ENDPOINT-1: POST /delete-project-csvs
 # ════════════════════════════════════════════════════════════════
+
+@app.post("/copy-project-csvs")
+def copy_project_csvs(req: CopyProjectCsvsRequest):
+    """
+    Copy engineered CSVs from sourceProjectId to newProjectId in GridFS.
+
+    Called by Node's ProjectController after a dataset dedup hit when a
+    NEW objective is selected for the reused project. Because each projectId
+    gets its own GridFS CSV keys, the new project can't find its CSVs until
+    they are copied from the source project.
+
+    This endpoint is idempotent — it is safe to call multiple times.
+    """
+    try:
+        _ensure_gfs()
+        if not _GFS_AVAILABLE:
+            return {
+                "status":  "error",
+                "message": "GridFS not available — cannot copy CSVs.",
+                "results": {},
+            }
+
+        results = _gfs_module.copy_all_project_csvs(req.sourceProjectId, req.newProjectId)
+        all_ok  = all(results.values())
+        msg     = (
+            f"Copied {sum(results.values())}/3 CSV files from "
+            f"{req.sourceProjectId} → {req.newProjectId}."
+        )
+        print(f"[CopyCSVs] {msg} results={results}")
+        return {
+            "status":  "success" if all_ok else "partial",
+            "message": msg,
+            "results": results,
+            "sourceProjectId": req.sourceProjectId,
+            "newProjectId":    req.newProjectId,
+        }
+    except Exception as e:
+        _tb.print_exc()
+        return {
+            "status":  "error",
+            "message": str(e),
+            "results": {},
+        }
+
 
 @app.post("/delete-project-csvs")
 def delete_project_csvs(req: DeleteProjectCsvsRequest):
@@ -1631,8 +1681,52 @@ def train_models(req: TrainRequest):
                             restored_ok.append(label)
                             print(f"[Train] ✅ Restored {label} from GridFS ({round(len(csv_bytes)/1024,1)}KB)")
                         else:
-                            failed.append(f"{label} (not in GridFS key={gfs_key})")
-                            print(f"[Train] ❌ {label}: not found in GridFS key={gfs_key}")
+                            # FIX: New project's CSV keys may not exist yet when the user
+                            # uploads the same datasets and picks a DIFFERENT objective.
+                            # The async CSV copy from ProjectController may not have
+                            # finished yet. Fall back to the source project's CSV keys.
+                            source_pid = getattr(req, "reusedFromProjectId", None)
+                            fallback_loaded = False
+                            if source_pid:
+                                src_key_fn = {
+                                    "ecommerce":   _gfs_module.eco_csv_key,
+                                    "marketing":   _gfs_module.mkt_csv_key,
+                                    "advertising": _gfs_module.adv_csv_key,
+                                }[label]
+                                src_gfs_key = src_key_fn(source_pid)
+                                print(
+                                    f"[Train] {label}: not in {gfs_key} — "
+                                    f"trying source project fallback: {src_gfs_key}"
+                                )
+                                if _gfs_module.csv_exists(src_gfs_key):
+                                    csv_bytes = _gfs_module.load_csv(src_gfs_key)
+                                    os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+                                    with open(disk_path, "wb") as _fh:
+                                        _fh.write(csv_bytes)
+                                    restored_ok.append(label)
+                                    fallback_loaded = True
+                                    # Also copy to new project's key so future requests are fast
+                                    try:
+                                        _gfs_module.copy_csv(src_gfs_key, gfs_key,
+                                                             metadata={"projectId": req.projectId,
+                                                                       "type": label,
+                                                                       "copiedFrom": source_pid})
+                                    except Exception as _cp_err:
+                                        print(f"[Train] ⚠️  Copy to new key failed (non-fatal): {_cp_err}")
+                                    print(
+                                        f"[Train] ✅ Restored {label} from SOURCE project "
+                                        f"({source_pid}) GridFS ({round(len(csv_bytes)/1024,1)}KB)"
+                                    )
+                                else:
+                                    print(
+                                        f"[Train] ❌ {label}: not found in source project "
+                                        f"GridFS either (key={src_gfs_key})"
+                                    )
+
+                            if not fallback_loaded:
+                                failed.append(f"{label} (not in GridFS key={gfs_key}"
+                                              + (f", source={src_gfs_key}" if source_pid else "") + ")")
+                                print(f"[Train] ❌ {label}: not found in GridFS key={gfs_key}")
                     except Exception as _re:
                         failed.append(f"{label}: {_re}")
                         print(f"[Train] ❌ {label} restore error: {_re}")
@@ -1643,7 +1737,9 @@ def train_models(req: TrainRequest):
                         "message": (
                             f"Engineered CSV files are not on disk and could not be restored from GridFS: "
                             f"{'; '.join(failed)}. "
-                            "This happens when the server restarts after a long idle period. "
+                            "This happens when the server restarts after a long idle period, OR when "
+                            "you are training with a new objective on reused datasets before the CSV "
+                            "copy to the new project has completed. "
                             "Please re-upload your datasets to continue."
                         ),
                         "projectId":       req.projectId,
