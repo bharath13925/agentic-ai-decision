@@ -1,46 +1,20 @@
 """
-AgenticIQ — Python Microservice v15.0
+AgenticIQ — Python Microservice v15.1
 
-FIXES vs v14.0:
+FIXES vs v15.0:
 
-  FIX GRIDFS-1 — ALL PKLs SAVED TO GRIDFS (not disk):
-    RF, XGBoost, LightGBM, and kpi_predictor are all saved to disk temporarily
-    during training, then immediately uploaded to MongoDB GridFS via
-    gridfs_storage.save_pickle(). The disk copy is deleted after upload.
-    Returned model_paths and kpiPredictorPath are now always GridFS keys
-    like "{projectId}/models/random_forest.pkl" — matching what
-    MlController.js's pklAccessible() check expects (includes "/models/")).
+  FIX STARTUP-1 — LAZY IMPORTS (fixes Render "No open ports detected"):
+    ALL heavy imports (CrewAI, Groq, RAG, GridFS, ML libs) are now deferred
+    to first use via module-level None sentinels + _ensure_X() helpers.
+    The FastAPI app + /health endpoint are available within ~2 seconds of
+    process start, well within Render's 30-60 sec port-open deadline.
 
-  FIX GRIDFS-2 — ALL PKL LOADING FROM GRIDFS:
-    run_agent_pipeline, score_strategies, and compute_shap all load PKLs
-    via gridfs_storage.load_pickle() when the path is a GridFS key.
-    Disk-path fallback retained for local dev without MONGO_URI.
+  FIX STARTUP-2 — TOP-LEVEL IMPORT GUARD:
+    sklearn, xgboost, lightgbm, shap are NOT imported at module level.
+    They are imported inside the endpoint functions that need them.
 
-  FIX CREW-1 — run_agent_pipeline ROUTES THROUGH crew_pipeline:
-    Previously called agents directly. Now calls run_crew_pipeline() from
-    crew_pipeline.py, which uses real CrewAI/Groq when available and falls
-    back to rule-based pipeline automatically.
-
-  FIX ENDPOINT-1 — /delete-project-csvs ENDPOINT ADDED:
-    FeedbackController.js calls this after compute-shap succeeds.
-    Deletes engineered CSV copies on the Python side.
-
-  FIX ECO-1 — ECO_RAW_FEATURES ALIGNED WITH SIMULATION AGENT:
-    simulation_agent.py does NOT include quantity, discount_amount, rating
-    in its ECO_RAW_FEATURES (they were dropped in v7.9 FIX FEAT-C because
-    they caused dimension mismatches). app.py now keeps them in training
-    (they improve accuracy) but the PKL bundle's feature_cols list is what
-    matters for scoring — the PKL stores exactly what was trained.
-    simulation_agent reads feature_cols from the PKL bundle, so alignment
-    is automatic.
-
-  FIX ACC-1 thru FIX SHAP-3 from v14.0 all RETAINED.
-
-  ACCURACY NOTE (99.5%):
-    This is correct and expected. added_to_cart is a pre-purchase signal
-    collected BEFORE the purchase decision — not data leakage. A customer
-    who adds to cart is 4-8x more likely to purchase. The model learned
-    this real-world pattern. The accuracy is legitimate.
+  All GRIDFS-1, GRIDFS-2, CREW-1, ENDPOINT-1, ECO-1, ACC-1 fixes from
+  v15.0 are fully retained.
 """
 
 import os
@@ -59,31 +33,13 @@ from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 load_dotenv()
 
-from agents import observer_agent, analyst_agent, simulation_agent, decision_agent
-from crew_pipeline import run_crew_pipeline
-
-from rag import (
-    store_agent_context as _rag_store,
-    rag_chat            as _rag_chat,
-    get_store_stats     as _rag_stats,
-    clear_project_store as _rag_clear,
-)
-
-# ── GridFS storage — always used for PKLs ───────────────────────────────────
-try:
-    import gridfs_storage as _gfs
-    _GFS_AVAILABLE = True
-    print("[Startup] ✅ GridFS storage module loaded — PKLs will go to MongoDB GridFS")
-except Exception as _gfs_err:
-    _GFS_AVAILABLE = False
-    print(f"[Startup] ⚠️  GridFS storage not available ({_gfs_err}) — PKLs will use disk only")
-
 # ── FIX ENG-4: resolve UPLOADS_DIR to absolute path at startup ─────────────
 _raw_uploads = os.environ.get("UPLOADS_DIR", "./uploads")
 UPLOADS_DIR  = os.path.abspath(_raw_uploads)
 print(f"[Startup] UPLOADS_DIR resolved → {UPLOADS_DIR}")
 
-app = FastAPI(title="AgenticIQ Python Microservice", version="15.0")
+# ── FastAPI app — created immediately so Render sees the port fast ──────────
+app = FastAPI(title="AgenticIQ Python Microservice", version="15.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -91,8 +47,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ════════════════════════════════════════════════════════════════
+#  FIX STARTUP-1 — LAZY MODULE SENTINELS
+#  All heavy modules start as None and are loaded on first use.
+# ════════════════════════════════════════════════════════════════
+_gfs_module        = None   # gridfs_storage
+_GFS_AVAILABLE     = None   # True / False (set on first _ensure_gfs())
+_rag_module        = None   # rag
+_crew_module       = None   # crew_pipeline
+_agents_module     = None   # agents package dict
+_decision_agent    = None   # agents.decision_agent.run
+
+
+def _ensure_gfs():
+    global _gfs_module, _GFS_AVAILABLE
+    if _GFS_AVAILABLE is not None:
+        return _GFS_AVAILABLE
+    try:
+        import gridfs_storage as _gfs
+        _gfs_module    = _gfs
+        _GFS_AVAILABLE = True
+        print("[LazyLoad] ✅ GridFS storage module loaded")
+    except Exception as _e:
+        _GFS_AVAILABLE = False
+        print(f"[LazyLoad] ⚠️  GridFS not available ({_e}) — disk fallback")
+    return _GFS_AVAILABLE
+
+
+def _ensure_rag():
+    global _rag_module
+    if _rag_module is not None:
+        return _rag_module
+    from rag import (
+        store_agent_context as _rag_store,
+        rag_chat            as _rag_chat,
+        get_store_stats     as _rag_stats,
+        clear_project_store as _rag_clear,
+    )
+    _rag_module = {
+        "store":  _rag_store,
+        "chat":   _rag_chat,
+        "stats":  _rag_stats,
+        "clear":  _rag_clear,
+    }
+    print("[LazyLoad] ✅ RAG module loaded")
+    return _rag_module
+
+
+def _ensure_crew():
+    global _crew_module
+    if _crew_module is not None:
+        return _crew_module
+    from crew_pipeline import run_crew_pipeline
+    _crew_module = run_crew_pipeline
+    print("[LazyLoad] ✅ crew_pipeline loaded")
+    return _crew_module
+
+
+def _ensure_decision_agent():
+    global _decision_agent
+    if _decision_agent is not None:
+        return _decision_agent
+    from agents.decision_agent import run as _dec_run
+    _decision_agent = _dec_run
+    print("[LazyLoad] ✅ decision_agent loaded")
+    return _decision_agent
+
+
 # ── Feature column definitions ──────────────────────────────────────────────
-# FIX ACC-1: added_to_cart is the strongest non-leaky predictor of purchase.
 ECO_RAW_FEATURES = [
     "device_type", "user_type", "marketing_channel", "product_category",
     "unit_price", "quantity", "discount_percent", "discount_amount",
@@ -170,26 +192,19 @@ _SAFE_DEFAULTS: Dict[str, float] = {
 # ════════════════════════════════════════════════════════════════
 
 def _is_gridfs_key(path_or_key: str) -> bool:
-    """True if the string is a GridFS key (contains /models/) rather than a disk path."""
     if not path_or_key:
         return False
     return "/models/" in path_or_key and not os.path.isabs(path_or_key)
 
 
 def _save_pkl_to_gridfs(obj: Any, gridfs_key: str, disk_path: str) -> str:
-    """
-    Save pickle to disk temporarily, upload to GridFS, delete disk copy.
-    Returns the GridFS key on success; disk_path on failure (fallback).
-    """
-    # Always write to disk first (required by pickle.dump)
     os.makedirs(os.path.dirname(disk_path), exist_ok=True)
     with open(disk_path, "wb") as f:
         pickle.dump(obj, f)
 
-    if _GFS_AVAILABLE:
+    if _ensure_gfs():
         try:
-            _gfs.save_pickle(obj, gridfs_key)
-            # Delete disk copy after successful GridFS upload
+            _gfs_module.save_pickle(obj, gridfs_key)
             try:
                 os.remove(disk_path)
             except Exception:
@@ -205,18 +220,13 @@ def _save_pkl_to_gridfs(obj: Any, gridfs_key: str, disk_path: str) -> str:
 
 
 def _load_pkl_from_gridfs_or_disk(path_or_key: str) -> Any:
-    """
-    Load a pickle from GridFS (if key) or disk (if path).
-    Raises FileNotFoundError if not found anywhere.
-    """
-    if _GFS_AVAILABLE and _is_gridfs_key(path_or_key):
+    if _ensure_gfs() and _is_gridfs_key(path_or_key):
         try:
-            return _gfs.load_pickle(path_or_key)
+            return _gfs_module.load_pickle(path_or_key)
         except Exception as e:
             raise FileNotFoundError(
                 f"GridFS key '{path_or_key}' not found: {e}. Please retrain models."
             )
-    # Disk fallback
     if os.path.exists(path_or_key):
         with open(path_or_key, "rb") as f:
             return pickle.load(f)
@@ -369,17 +379,17 @@ class DeleteProjectCsvsRequest(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════
-#  HEALTH
+#  HEALTH — returns instantly, no heavy deps needed
 # ════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {"status": "OK", "service": "AgenticIQ v15.0"}
+    return {"status": "OK", "service": "AgenticIQ v15.1"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "service": "AgenticIQ v15.0"}
+    return {"status": "OK", "service": "AgenticIQ v15.1"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -389,7 +399,8 @@ def health():
 @app.post("/store-agent-context")
 def store_agent_context(req: StoreContextRequest):
     try:
-        result = _rag_store(
+        rag = _ensure_rag()
+        result = rag["store"](
             project_id=req.projectId,
             agent_result=req.agentResult,
             kpi_summary=req.kpiSummary,
@@ -411,7 +422,8 @@ def rag_chat_endpoint(req: RagQueryRequest):
     try:
         if not req.query or not req.query.strip():
             return {"status": "error", "message": "Query cannot be empty.", "answer": ""}
-        result = _rag_chat(
+        rag = _ensure_rag()
+        result = rag["chat"](
             project_id=req.projectId,
             query=req.query.strip(),
             model=req.model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
@@ -431,7 +443,8 @@ def rag_chat_endpoint(req: RagQueryRequest):
 @app.get("/rag-stats/{project_id}")
 def rag_stats_endpoint(project_id: str):
     try:
-        stats = _rag_stats(project_id)
+        rag = _ensure_rag()
+        stats = rag["stats"](project_id)
         return {"status": "success", "projectId": project_id, **stats}
     except Exception as e:
         return {"status": "error", "message": str(e), "exists": False}
@@ -440,7 +453,8 @@ def rag_stats_endpoint(project_id: str):
 @app.delete("/rag-clear/{project_id}")
 def rag_clear_endpoint(project_id: str):
     try:
-        cleared = _rag_clear(project_id)
+        rag = _ensure_rag()
+        cleared = rag["clear"](project_id)
         return {
             "status":    "success",
             "projectId": project_id,
@@ -453,7 +467,6 @@ def rag_clear_endpoint(project_id: str):
 
 # ════════════════════════════════════════════════════════════════
 #  FIX ENDPOINT-1: POST /delete-project-csvs
-#  Called by FeedbackController.js after compute-shap succeeds.
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/delete-project-csvs")
@@ -700,7 +713,6 @@ def engineer_features(req: EngineerRequest):
             df_eco["cart_time_ratio"]  = (atc * (ts2 / max(max_time,  1.0))).round(4)
             df_eco["cart_pages_ratio"] = (atc * (pv2 / max(max_pages, 1.0))).round(4)
 
-        # New interaction features for v15.0 / simulation_agent v8.0
         if "visit_weekday" in df_eco.columns:
             wd = pd.to_numeric(df_eco["visit_weekday"], errors="coerce").fillna(3)
             df_eco["is_weekend"] = (wd >= 5).astype(float)
@@ -837,7 +849,6 @@ def engineer_features(req: EngineerRequest):
             "totalAbandoned":     total_abandoned,
         }
         print(f"[Engineer] REAL KPI Summary: {kpi_summary}")
-        print(f"[Engineer] Normalization: max_pages={max_pages}, max_time={max_time}")
 
         return {
             "status":          "success",
@@ -918,21 +929,22 @@ def _add_derived_features_post_split(
 
 # ════════════════════════════════════════════════════════════════
 #  POST /train-models
-#  FIX GRIDFS-1: All PKLs uploaded to GridFS; returns GridFS keys
+#  FIX STARTUP-2: sklearn/xgboost/lightgbm imported inside function
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/train-models")
 def train_models(req: TrainRequest):
     import warnings
     warnings.filterwarnings("ignore")
-    try:
-        from sklearn.ensemble        import RandomForestClassifier
-        from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
-        from sklearn.preprocessing   import LabelEncoder
-        from sklearn.metrics         import roc_auc_score
-        import xgboost  as xgb
-        import lightgbm as lgb
+    # FIX STARTUP-2: lazy import of ML libs
+    from sklearn.ensemble        import RandomForestClassifier
+    from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
+    from sklearn.preprocessing   import LabelEncoder
+    from sklearn.metrics         import roc_auc_score
+    import xgboost  as xgb
+    import lightgbm as lgb
 
+    try:
         uploads_dir = os.path.abspath(req.uploadsDir)
         models_dir  = os.path.join(uploads_dir, "models", req.projectId)
         os.makedirs(models_dir, exist_ok=True)
@@ -958,7 +970,7 @@ def train_models(req: TrainRequest):
         df_adv = pd.read_csv(adv_path, low_memory=False)
 
         print(f"[Train] Loaded: eco={len(df_eco)}, mkt={len(df_mkt)}, adv={len(df_adv)}")
-        print(f"[Train] Objective: {req.objective} | Pipeline: v15.0 (GridFS PKLs)")
+        print(f"[Train] Objective: {req.objective} | Pipeline: v15.1 (GridFS PKLs)")
 
         df_raw, target_col, raw_feature_cols = _build_training_data(
             df_eco, df_mkt, df_adv, req.objective
@@ -1046,7 +1058,6 @@ def train_models(req: TrainRequest):
         except Exception:
             roc_auc_scores_["randomForest"] = results["randomForest"]["accuracy"] / 100.0
 
-        # FIX GRIDFS-1: save RF to GridFS
         rf_bundle    = {"model": rf, "feature_cols": feature_cols}
         rf_disk_path = os.path.join(models_dir, "random_forest.pkl")
         rf_gfs_key   = f"{req.projectId}/models/random_forest.pkl"
@@ -1100,7 +1111,6 @@ def train_models(req: TrainRequest):
         except Exception:
             roc_auc_scores_["xgboost"] = results["xgboost"]["accuracy"] / 100.0
 
-        # FIX GRIDFS-1: save XGB to GridFS
         xgb_bundle    = {"model": xgb_model, "le": le, "feature_cols": feature_cols}
         xgb_disk_path = os.path.join(models_dir, "xgboost.pkl")
         xgb_gfs_key   = f"{req.projectId}/models/xgboost.pkl"
@@ -1155,7 +1165,6 @@ def train_models(req: TrainRequest):
         except Exception:
             roc_auc_scores_["lightgbm"] = results["lightgbm"]["accuracy"] / 100.0
 
-        # FIX GRIDFS-1: save LGB to GridFS
         lgb_bundle    = {"model": lgb_model, "le": le_lgb, "feature_cols": feature_cols}
         lgb_disk_path = os.path.join(models_dir, "lightgbm.pkl")
         lgb_gfs_key   = f"{req.projectId}/models/lightgbm.pkl"
@@ -1220,7 +1229,7 @@ def train_models(req: TrainRequest):
             f"Weights RF={round(w_rf,3)} XGB={round(w_xgb,3)} LGB={round(w_lgb,3)}"
         )
 
-        # ── KPI Regressor — also saved to GridFS ──
+        # ── KPI Regressor ──
         print("[Train] Training KPI Regressor...")
         kpi_predictor_path = _train_kpi_regressor(
             df_eco, df_mkt, df_adv, feature_cols, models_dir, req.projectId,
@@ -1342,7 +1351,7 @@ def train_models(req: TrainRequest):
             "message": (
                 f"All 3 models + KPI regressor trained on {len(X_train)} "
                 f"real rows (test={len(X_test)}, features={len(feature_cols)}). "
-                f"v15.0: all PKLs in GridFS."
+                f"v15.1: all PKLs in GridFS."
             ),
             "projectId":              req.projectId,
             "models":                 results,
@@ -1356,7 +1365,7 @@ def train_models(req: TrainRequest):
             "learnedMechanismStrengths": learned_mechanism_strengths,
             "learnedObjectiveWeights":   learned_objective_weights,
             "kpiPredictorPath":          kpi_predictor_path,
-            "pipelineVersion":           "v15.0",
+            "pipelineVersion":           "v15.1",
             "storageBackend":            "gridfs",
             "modelPaths": {
                 "randomForest": model_paths["randomForest"],
@@ -1371,7 +1380,7 @@ def train_models(req: TrainRequest):
 
 
 # ════════════════════════════════════════════════════════════════
-#  KPI REGRESSOR — FIX GRIDFS-1: saves to GridFS too
+#  KPI REGRESSOR
 # ════════════════════════════════════════════════════════════════
 
 def _train_kpi_regressor(
@@ -1379,7 +1388,7 @@ def _train_kpi_regressor(
     max_pages_train: float = 30.0,
     max_time_train:  float = 1800.0,
 ) -> str:
-    """Train KPI regressor, save to GridFS, return GridFS key (or disk path fallback)."""
+    # FIX STARTUP-2: lazy import
     from sklearn.ensemble import RandomForestRegressor
     from sklearn.metrics  import r2_score
 
@@ -1436,8 +1445,6 @@ def _train_kpi_regressor(
     ppp_99 = max(float((price_tr / pages_tr).quantile(0.99)), 1.0)
     p98    = max(float(price_tr.quantile(0.98)), 1.0)
     d_max  = max(float(disc_tr.max()), 1.0)
-
-    print(f"[KPIReg] Norm constants: di_99={di_99:.1f}  ppp_99={ppp_99:.2f}  p98={p98:.1f}")
 
     ch_conv_map = {}
     if "marketing_channel" in df.columns:
@@ -1621,14 +1628,13 @@ def _train_kpi_regressor(
         "r2_scores":    r2_scores,
     }
 
-    # FIX GRIDFS-1: save kpi_predictor to GridFS
     kpi_disk_path = os.path.join(models_dir, "kpi_predictor.pkl")
     kpi_gfs_key   = f"{project_id}/models/kpi_predictor.pkl"
     return _save_pkl_to_gridfs(reg_bundle, kpi_gfs_key, kpi_disk_path)
 
 
 # ════════════════════════════════════════════════════════════════
-#  POST /score-strategies — FIX GRIDFS-2: loads from GridFS
+#  POST /score-strategies
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/score-strategies")
@@ -1671,7 +1677,6 @@ def score_strategies(req: ScoreStrategiesRequest):
                 model_load_errors[model_key] = "empty path"
                 continue
             try:
-                # FIX GRIDFS-2: load from GridFS if key format, else disk
                 models_loaded[model_key] = _load_pkl_from_gridfs_or_disk(model_path)
             except Exception as load_err:
                 model_load_errors[model_key] = str(load_err)
@@ -1783,8 +1788,7 @@ def _unwrap_feature_cols(loaded: Any) -> Optional[List[str]]:
 
 # ════════════════════════════════════════════════════════════════
 #  POST /run-agent-pipeline
-#  FIX CREW-1: routes through crew_pipeline.run_crew_pipeline()
-#  FIX GRIDFS-2: loads kpi_predictor_bundle + classifier PKLs from GridFS
+#  FIX CREW-1: routes through crew_pipeline (lazy loaded)
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/run-agent-pipeline")
@@ -1809,12 +1813,12 @@ def run_agent_pipeline(req: AgentPipelineRequest):
         )
         strategy_input = req.strategyInput if sim_mode == "mode1" else {}
 
-        learned_strengths = getattr(req, "learnedMechanismStrengths", None)
-        learned_weights   = getattr(req, "learnedObjectiveWeights",   None)
+        learned_strengths  = getattr(req, "learnedMechanismStrengths", None)
+        learned_weights    = getattr(req, "learnedObjectiveWeights",   None)
         feature_importance = req.featureImportance or []
         ensemble_weights   = req.ensembleWeights or {"rf": 1/3, "xgb": 1/3, "lgb": 1/3}
 
-        # FIX GRIDFS-2: load kpi_predictor_bundle from GridFS
+        # Load kpi_predictor bundle (lazy GridFS)
         kpi_predictor_bundle = None
         kpi_predictor_path   = req.kpiPredictorPath
         if kpi_predictor_path:
@@ -1823,7 +1827,6 @@ def run_agent_pipeline(req: AgentPipelineRequest):
                 print(f"[Agent] ✅ KPI predictor bundle loaded from: {kpi_predictor_path}")
             except Exception as kpi_err:
                 print(f"[Agent] ⚠️  KPI predictor load failed: {kpi_err}")
-                kpi_predictor_bundle = None
 
         if kpi_predictor_bundle is None:
             raise ValueError(
@@ -1831,7 +1834,8 @@ def run_agent_pipeline(req: AgentPipelineRequest):
                 "Please retrain models."
             )
 
-        # FIX CREW-1: route through crew_pipeline (uses CrewAI+Groq or falls back to rule-based)
+        # FIX CREW-1: lazy-load crew_pipeline
+        run_crew_pipeline = _ensure_crew()
         pipeline_result = run_crew_pipeline(
             project_id=req.projectId,
             objective=req.objective,
@@ -1855,22 +1859,20 @@ def run_agent_pipeline(req: AgentPipelineRequest):
 
         print(f"[Agent] Crew pipeline done: {len(strategies)} strategies")
 
-        # FIX GRIDFS-2: PKL scoring for per-strategy probabilities
+        # Per-strategy PKL scoring
         per_strategy_ml_scores: Dict[str, float] = {}
         model_paths  = req.modelPaths or {}
         uploads_dir  = req.uploadsDir
 
         if model_paths:
             try:
-                # Load base vector either from CSV or dataset_stats
                 base_vector: Dict[str, float] = {}
-                avail_features: List[str] = list(ECO_FEATURES)  # default
+                avail_features: List[str] = list(ECO_FEATURES)
                 max_pages = float(dataset_stats.get("_max_pages", 30.0))
                 max_time  = float(dataset_stats.get("_max_time", 1800.0))
                 max_pages = max(max_pages, 1.0)
                 max_time  = max(max_time,  1.0)
 
-                # Try to load base vector from CSV if it still exists
                 eco_file = getattr(req, "ecommerceEngineerFile", None)
                 if eco_file and uploads_dir:
                     uploads_dir_abs = os.path.abspath(uploads_dir)
@@ -1885,7 +1887,6 @@ def run_agent_pipeline(req: AgentPipelineRequest):
                                 col = pd.to_numeric(df_eco[feat], errors="coerce")
                                 base_vector[feat] = float(col.median())
 
-                # Fall back to dataset_stats medians if CSV gone
                 if not base_vector:
                     for feat in ECO_FEATURES:
                         if feat in dataset_stats and isinstance(dataset_stats[feat], dict):
@@ -1894,7 +1895,6 @@ def run_agent_pipeline(req: AgentPipelineRequest):
                             base_vector[feat] = _SAFE_DEFAULTS.get(feat, 0.0)
                     avail_features = list(ECO_FEATURES)
 
-                # FIX GRIDFS-2: load classifier PKLs from GridFS
                 models_loaded_agent: Dict[str, Any] = {}
                 for mkey, mpath in model_paths.items():
                     if not mpath:
@@ -1917,7 +1917,6 @@ def run_agent_pipeline(req: AgentPipelineRequest):
                             X  = np.array([[vec.get(f, 0.0) for f in avail_features]])
                             ep = _predict_ensemble_proba(models_loaded_agent, X, ensemble_weights)
                             per_strategy_ml_scores[sid] = ep
-                            print(f"[Agent] PKL score for {sid}: {ep:.4f}")
                         except Exception as se:
                             print(f"[Agent] Strategy PKL score failed for {sid}: {se}")
                 else:
@@ -1929,7 +1928,7 @@ def run_agent_pipeline(req: AgentPipelineRequest):
         # Re-run decision with per-strategy PKL scores
         if per_strategy_ml_scores:
             try:
-                from agents.decision_agent import run as _dec_run
+                _dec_run = _ensure_decision_agent()
                 decision_result = _dec_run(
                     simulation_result=simulation_result,
                     analyst_result=analyst_result,
@@ -1942,17 +1941,13 @@ def run_agent_pipeline(req: AgentPipelineRequest):
                     per_strategy_ml_scores=per_strategy_ml_scores,
                     dataset_stats=dataset_stats,
                 )
-                print(
-                    f"[Agent] Decision (PKL-scored): "
-                    f"top='{decision_result['recommendation']['strategyName']}' "
-                    f"confidence={decision_result['recommendation']['confidence']}%"
-                )
             except Exception as dec_err:
                 print(f"[Agent] Decision re-run with PKL scores failed (using crew result): {dec_err}")
 
         # Auto-store RAG context
         try:
-            rag_result = _rag_store(
+            rag = _ensure_rag()
+            rag_result = rag["store"](
                 project_id=req.projectId,
                 agent_result={
                     "observerResult":   observer_result,
@@ -2124,7 +2119,6 @@ def _build_strategy_feature_vector(
             vec["pages_viewed"]     = _med("pages_viewed")     * min(scale, 1.20)
             vec["time_on_site_sec"] = _med("time_on_site_sec") * min(scale, 1.15)
 
-    # Recompute all derived features from updated raw values
     pages = max(float(vec.get("pages_viewed",     _med("pages_viewed"))),  1.0)
     time_ = float(vec.get("time_on_site_sec", _med("time_on_site_sec")))
     price = float(vec.get("unit_price",       _med("unit_price")))
@@ -2288,6 +2282,7 @@ def _metrics(
     train_time: float,
     y_prob: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
+    # FIX STARTUP-2: lazy import
     from sklearn.metrics import (
         accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
     )
@@ -2435,12 +2430,14 @@ def _shap_importance_fallback(req: SHAPRequest, error: Optional[str] = None) -> 
 
 
 # ════════════════════════════════════════════════════════════════
-#  POST /compute-shap — FIX GRIDFS-2: loads from GridFS
+#  POST /compute-shap
+#  FIX STARTUP-2: shap imported inside function
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/compute-shap")
 def compute_shap(req: SHAPRequest):
     import warnings; warnings.filterwarnings("ignore")
+    # FIX STARTUP-2: lazy import of shap
     try:
         import shap as shap_lib
     except ImportError:
@@ -2448,11 +2445,9 @@ def compute_shap(req: SHAPRequest):
         return _shap_importance_fallback(req, error="shap package not installed (pip install shap)")
 
     try:
-        # ── Step 1: Load the PKL model from GridFS or disk ──────────────
         if not req.modelPath:
             raise FileNotFoundError("modelPath is empty. Please retrain models.")
 
-        # FIX GRIDFS-2: load from GridFS if key format
         loaded = _load_pkl_from_gridfs_or_disk(req.modelPath)
 
         model     = _unwrap_model(loaded)
@@ -2460,7 +2455,6 @@ def compute_shap(req: SHAPRequest):
         if isinstance(loaded, tuple):
             model = loaded[0]
 
-        # ── Step 2: Determine feature list ──────────────────────────────
         feature_cols: Optional[List[str]] = None
 
         if stored_fc and len(stored_fc) > 0:
@@ -2489,12 +2483,10 @@ def compute_shap(req: SHAPRequest):
         if not feature_cols:
             raise ValueError("Could not determine the feature list used during training.")
 
-        # ── Step 3: Verify model/feature count consistency ──────────────
         expected_feats = getattr(model, "n_features_in_", None)
         if expected_feats is not None and expected_feats != len(feature_cols):
             uploads_dir  = os.path.abspath(req.uploadsDir)
             eco_path     = os.path.join(uploads_dir, req.ecommerceFile)
-            csv_based    = None
             if os.path.exists(eco_path):
                 csv_cols  = pd.read_csv(eco_path, nrows=0, low_memory=False).columns.tolist()
                 csv_based = [f for f in ECO_FEATURES if f in csv_cols]
@@ -2512,7 +2504,6 @@ def compute_shap(req: SHAPRequest):
                     f"{len(feature_cols)}. Please retrain models."
                 )
 
-        # ── Step 4: Build sample matrix ─────────────────────────────────
         uploads_dir = os.path.abspath(req.uploadsDir)
         eco_path    = os.path.join(uploads_dir, req.ecommerceFile)
 
@@ -2531,7 +2522,6 @@ def compute_shap(req: SHAPRequest):
             X = df_sample[feature_cols].values.astype(np.float32)
             print(f"[SHAP] Sample built from CSV: {X.shape}")
         else:
-            # CSV deleted after SHAP — build synthetic sample from SAFE_DEFAULTS
             print("[SHAP] CSV not found — building synthetic sample from SAFE_DEFAULTS medians")
             n_samples = 200
             X_rows    = []
@@ -2546,7 +2536,6 @@ def compute_shap(req: SHAPRequest):
         if X.shape[0] < 10:
             raise ValueError(f"Insufficient sample size for SHAP: {X.shape[0]} rows")
 
-        # ── Step 5: Compute SHAP values ──────────────────────────────────
         print(f"[SHAP] Running TreeExplainer on {X.shape[0]} samples × {X.shape[1]} features...")
         explainer   = shap_lib.TreeExplainer(model)
         shap_values = explainer.shap_values(X, check_additivity=False)
@@ -2595,7 +2584,7 @@ def compute_shap(req: SHAPRequest):
             ),
             "sampleSize":  int(X.shape[0]),
             "fallback":    False,
-            "shapVersion": "v15.0-gridfs",
+            "shapVersion": "v15.1-gridfs",
         }
 
     except Exception as e:
