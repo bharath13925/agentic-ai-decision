@@ -384,14 +384,40 @@ const trainModels = async (req, res) => {
     ].filter(Boolean);
 
     if (missingDisk.length > 0) {
-      console.error(`[ML:train] ❌ Engineered CSVs missing for ${projectId}: ${missingDisk.join(", ")}`);
-      return res.status(400).json({
-        message:
-          "Engineered CSV files are missing on disk (server restart or re-upload needed). " +
-          "Missing: " + missingDisk.join(", "),
-        requiresReupload: true,
-        missingFiles:     missingDisk,
-      });
+      // ── FIX: Try to restore CSVs from GridFS before erroring ──
+      console.log(
+        `[ML:train] ⚠️  CSVs missing from disk — attempting GridFS restore: ${missingDisk.join(", ")}`
+      );
+      try {
+        const restoreRes = await axios.post(
+          `${PYTHON_URL}/restore-engineered-csvs`,
+          {
+            projectId:       projectId,
+            uploadsDir:      UPLOADS_DIR,
+            ecommerceFile:   project.engineeredFiles.ecommerce,
+            marketingFile:   project.engineeredFiles.marketing,
+            advertisingFile: project.engineeredFiles.advertising,
+          },
+          { timeout: 60000 }
+        );
+        if (restoreRes.data?.status !== "success") {
+          throw new Error(restoreRes.data?.message || "GridFS restore failed");
+        }
+        console.log(
+          `[ML:train] ✅ GridFS restore succeeded before training — ` +
+          `restored: ${JSON.stringify(restoreRes.data.restored)}`
+        );
+      } catch (restoreErr) {
+        console.error(`[ML:train] GridFS restore failed: ${restoreErr.message}`);
+        return res.status(400).json({
+          message:
+            "Engineered CSV files are missing on disk and could not be restored from GridFS. " +
+            "This happens when the server restarts after a long idle period. " +
+            "Please re-upload your datasets to continue. Missing: " + missingDisk.join(", "),
+          requiresReupload: true,
+          missingFiles:     missingDisk,
+        });
+      }
     }
 
     await Project.findByIdAndUpdate(project._id, { status: "engineered", errorMessage: null });
@@ -723,6 +749,7 @@ const triggerAgentPipeline = async (
    INTERNAL — ML Training trigger
    FIX: callPythonWithRetry was called as (url, data, 6000000) — the 3rd arg
    is `retries` not `timeout`. Fixed to (url, data, 2, 600000).
+   FIX CSV: Restore engineered CSVs from GridFS if /tmp was wiped (Render restart).
 ════════════════════════════════════════════════════════════════ */
 const triggerMLTraining = async (project, mlResult, objective) => {
   try {
@@ -737,21 +764,67 @@ const triggerMLTraining = async (project, mlResult, objective) => {
     const mktFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.marketing);
     const advFull = pathLib.join(UPLOADS_DIR, project.engineeredFiles.advertising);
 
-    const missingFiles = [
+    // ── FIX: Restore CSVs from GridFS if missing from disk (Render /tmp wipe) ──
+    const missingDisk = [
+      !fsLib.existsSync(ecoFull),
+      !fsLib.existsSync(mktFull),
+      !fsLib.existsSync(advFull),
+    ].some(Boolean);
+
+    if (missingDisk) {
+      console.log(
+        `[ML:train] ⚠️  Engineered CSVs missing from disk — attempting GridFS restore…`
+      );
+      try {
+        const restoreRes = await axios.post(
+          `${PYTHON_URL}/restore-engineered-csvs`,
+          {
+            projectId:       project.projectId,
+            uploadsDir:      UPLOADS_DIR,
+            ecommerceFile:   project.engineeredFiles.ecommerce,
+            marketingFile:   project.engineeredFiles.marketing,
+            advertisingFile: project.engineeredFiles.advertising,
+          },
+          { timeout: 60000 }
+        );
+        if (restoreRes.data?.status === "success") {
+          console.log(
+            `[ML:train] ✅ GridFS restore succeeded — ` +
+            `restored: ${JSON.stringify(restoreRes.data.restored)}`
+          );
+        } else {
+          throw new Error(restoreRes.data?.message || "GridFS restore failed");
+        }
+      } catch (restoreErr) {
+        const errMsg =
+          "Engineered files missing on disk and could not be restored from GridFS. " +
+          "Please re-upload your datasets. Error: " + restoreErr.message;
+        console.error(`[ML:train] ❌ ${project.projectId}: ${errMsg}`);
+        await MLResult.findByIdAndUpdate(mlResult._id, { status: "error", errorMessage: errMsg });
+        await Project.findOneAndUpdate(
+          { projectId: project.projectId },
+          { status: "error", errorMessage: errMsg }
+        );
+        return;
+      }
+    }
+
+    // Verify files now exist on disk after potential restore
+    const stillMissing = [
       !fsLib.existsSync(ecoFull) && ecoFull,
       !fsLib.existsSync(mktFull) && mktFull,
       !fsLib.existsSync(advFull) && advFull,
     ].filter(Boolean);
 
-    if (missingFiles.length > 0) {
+    if (stillMissing.length > 0) {
       const errMsg =
-        "Engineered files missing on disk. Please re-upload your datasets. " +
-        "Missing: " + missingFiles.join(", ");
+        "Engineered files still missing after GridFS restore attempt. " +
+        "Please re-upload your datasets. Missing: " + stillMissing.join(", ");
       console.error(`[ML:train] ❌ ${project.projectId}: ${errMsg}`);
       await MLResult.findByIdAndUpdate(mlResult._id, { status: "error", errorMessage: errMsg });
       await Project.findOneAndUpdate(
         { projectId: project.projectId },
-        { status: "error", errorMessage: errMsg }
+        { status: "error", errorMessage: `ML training failed: ${errMsg.slice(0, 300)}` }
       );
       return;
     }

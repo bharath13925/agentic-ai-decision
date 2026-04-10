@@ -503,6 +503,109 @@ def delete_project_csvs(req: DeleteProjectCsvsRequest):
 
 
 # ════════════════════════════════════════════════════════════════
+#  POST /restore-engineered-csvs  — NEW v5.0
+#  Restores engineered CSVs from GridFS to disk when /tmp is wiped
+#  (Render ephemeral filesystem on cold start / restart).
+# ════════════════════════════════════════════════════════════════
+
+class RestoreCsvsRequest(BaseModel):
+    projectId:       str
+    uploadsDir:      str
+    ecommerceFile:   str
+    marketingFile:   str
+    advertisingFile: str
+
+
+@app.post("/restore-engineered-csvs")
+def restore_engineered_csvs(req: RestoreCsvsRequest):
+    """
+    Restore engineered CSV files from GridFS to disk.
+    Called by Node.js MlController before ML training when /tmp files are missing
+    (Render ephemeral filesystem wipe after server restart).
+    """
+    try:
+        _ensure_gfs()
+        if not _GFS_AVAILABLE:
+            return {
+                "status":  "error",
+                "message": "GridFS not available — cannot restore CSVs.",
+                "restored": [],
+                "skipped":  [],
+                "errors":   ["GridFS unavailable"],
+            }
+
+        uploads_dir    = os.path.abspath(req.uploadsDir)
+        engineered_dir = os.path.join(uploads_dir, "engineered")
+        os.makedirs(engineered_dir, exist_ok=True)
+
+        file_map = {
+            "ecommerce":   (req.ecommerceFile,   _gfs_module.eco_csv_key(req.projectId)),
+            "marketing":   (req.marketingFile,   _gfs_module.mkt_csv_key(req.projectId)),
+            "advertising": (req.advertisingFile, _gfs_module.adv_csv_key(req.projectId)),
+        }
+
+        restored = []
+        skipped  = []
+        errors   = []
+
+        for key, (relative_path, gfs_key) in file_map.items():
+            if not relative_path:
+                skipped.append(key)
+                continue
+
+            disk_path = os.path.join(uploads_dir, relative_path)
+
+            # Already on disk — no need to restore
+            if os.path.exists(disk_path):
+                skipped.append(key)
+                print(f"[Restore] {key}: already on disk at {disk_path}")
+                continue
+
+            # Restore from GridFS
+            try:
+                csv_bytes = _gfs_module.load_csv(gfs_key)
+                os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+                with open(disk_path, "wb") as f:
+                    f.write(csv_bytes)
+                restored.append(key)
+                print(f"[Restore] ✅ {key}: restored {round(len(csv_bytes)/1024, 1)}KB → {disk_path}")
+            except FileNotFoundError:
+                errors.append(f"{key}: not found in GridFS (key={gfs_key})")
+                print(f"[Restore] ❌ {key}: not in GridFS ({gfs_key})")
+            except Exception as e:
+                errors.append(f"{key}: {e}")
+                print(f"[Restore] ❌ {key}: {e}")
+
+        if errors:
+            return {
+                "status":   "error",
+                "message":  f"Could not restore some CSVs from GridFS: {'; '.join(errors)}. "
+                            f"Please re-upload your datasets.",
+                "restored": restored,
+                "skipped":  skipped,
+                "errors":   errors,
+            }
+
+        return {
+            "status":   "success",
+            "message":  f"Restored {len(restored)} CSV(s) from GridFS.",
+            "restored": restored,
+            "skipped":  skipped,
+            "errors":   [],
+        }
+
+    except Exception as e:
+        _tb.print_exc()
+        return {
+            "status":  "error",
+            "message": f"Restore exception: {e}",
+            "restored": [],
+            "skipped":  [],
+            "errors":   [str(e)],
+        }
+
+
+# ════════════════════════════════════════════════════════════════
 #  POST /clean-datasets
 # ════════════════════════════════════════════════════════════════
 
@@ -747,9 +850,28 @@ def engineer_features(req: EngineerRequest):
             ("marketing",   df_mkt, "marketing"),
             ("advertising", df_adv, "advertising"),
         ]:
-            fname = f"{req.projectId}-{fname_key}-engineered.csv"
-            df.to_csv(os.path.join(engineered_dir, fname), index=False)
+            fname     = f"{req.projectId}-{fname_key}-engineered.csv"
+            disk_path = os.path.join(engineered_dir, fname)
+            df.to_csv(disk_path, index=False)
             engineered_files[key] = f"engineered/{fname}"
+
+            # NEW v5.0: persist to GridFS so CSVs survive /tmp wipes (Render restarts)
+            _ensure_gfs()
+            if _GFS_AVAILABLE:
+                try:
+                    _csv_key_fn = {
+                        "ecommerce":   _gfs_module.eco_csv_key,
+                        "marketing":   _gfs_module.mkt_csv_key,
+                        "advertising": _gfs_module.adv_csv_key,
+                    }[fname_key]
+                    gfs_csv_key = _csv_key_fn(req.projectId)
+                    with open(disk_path, "rb") as fh:
+                        _gfs_module.save_csv(fh.read(), gfs_csv_key,
+                                             metadata={"projectId": req.projectId,
+                                                       "type": fname_key})
+                    print(f"[Engineer] ✅ CSV backed up to GridFS: {gfs_csv_key}")
+                except Exception as gfs_err:
+                    print(f"[Engineer] ⚠️  GridFS CSV backup failed (non-fatal): {gfs_err}")
 
         def safe(val: Any) -> float:
             if val is None:
