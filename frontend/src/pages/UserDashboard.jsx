@@ -868,7 +868,8 @@ function Step3SimulationMode({ project, currentObjective, firebaseUser, onNext, 
 
 /* ════════════════════════════════════════════════════════════════
    STEP 4+5 AUTO PIPELINE
-   FIX X: strict single-fire guard via trainingStartedRef
+   FIX-DEPLOY: cache-busting, stale-closure fix, onDone wiring,
+   timeout guard, and robust 304-safe polling
 ════════════════════════════════════════════════════════════════ */
 function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, onBack, onDone }) {
   const [phase,        setPhase]        = useState("training_ml");
@@ -878,11 +879,20 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
   const [requiresRetrain, setRequiresRetrain] = useState(false);
   const [activeAgent,  setActiveAgent]  = useState(0);
   const [dots,         setDots]         = useState(1);
-  const mlPollRef        = useRef(null);
-  const agentPollRef     = useRef(null);
-  const agentStartedRef  = useRef(false);
-  const mlDoneRef        = useRef(false);
+  const mlPollRef          = useRef(null);
+  const agentPollRef       = useRef(null);
+  const agentStartedRef    = useRef(false);
+  const mlDoneRef          = useRef(false);
   const trainingStartedRef = useRef(false);
+  // FIX: use a ref to hold trainedMlResult so the interval closure is never stale
+  const trainedMlResultRef = useRef(null);
+  // FIX: track agent poll attempts for a timeout safety net (10 min max)
+  const agentPollCountRef  = useRef(0);
+  const MAX_AGENT_POLLS    = 200; // 200 × 3 s = 10 min
+
+  // FIX: cache-busting fetch — prevents 304 "Not Modified" empty-body on Vercel/Render CDN
+  const fetchNocache = (url, opts = {}) =>
+    fetch(`${url}?_t=${Date.now()}`, { ...opts, cache: "no-store" });
 
   useEffect(() => {
     if (trainingStartedRef.current) return;
@@ -898,34 +908,30 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
 
   const startMLTraining = async () => {
     try {
-      const res  = await fetch(`${API}/ml/train/${project.projectId}`, {
+      const res  = await fetchNocache(`${API}/ml/train/${project.projectId}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uid: firebaseUser.uid }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.message);
+      if (!res.ok) throw new Error(data.message || "ML training request failed.");
 
-      // FIX: When models are reused (HTTP 200 with status "complete"),
-      // fetch the MLResult immediately and proceed to agent pipeline
-      // without polling — avoids 3s+ delay waiting on a "training" event
-      // that will never come.
+      // FIX: HTTP 200 + reusedModels → models already in DB, skip polling
       if (res.status === 200 && data.status === "complete" && data.reusedModels) {
         if (mlDoneRef.current) return;
         mlDoneRef.current = true;
-        // Fetch the full MLResult doc from DB
-        const mlRes  = await fetch(`${API}/ml/result/${project.projectId}`);
+        const mlRes  = await fetchNocache(`${API}/ml/result/${project.projectId}`);
         const mlData = await mlRes.json();
         if (mlData.mlResult?.status === "complete") {
           setMlResult(mlData.mlResult);
+          trainedMlResultRef.current = mlData.mlResult;
           startAgentPipeline(mlData.mlResult);
         } else {
-          // Fallback to polling in case of timing edge-case
           pollMLResult();
         }
         return;
       }
 
-      // HTTP 202 — training started asynchronously, poll for completion
+      // HTTP 202 — training started async, poll for completion
       pollMLResult();
     } catch (err) { setErrMsg(err.message); setPhase("error"); }
   };
@@ -933,31 +939,37 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
   const pollMLResult = () => {
     mlPollRef.current = setInterval(async () => {
       try {
-        const res  = await fetch(`${API}/ml/result/${project.projectId}`);
+        // FIX: cache: "no-store" + timestamp param prevents 304 on Vercel/Render
+        const res  = await fetchNocache(`${API}/ml/result/${project.projectId}`);
+        if (!res.ok) return; // transient error — retry next tick
         const data = await res.json();
         if (data.mlResult?.status === "complete") {
           clearInterval(mlPollRef.current); mlPollRef.current = null;
           if (mlDoneRef.current) return;
           mlDoneRef.current = true;
           setMlResult(data.mlResult);
+          trainedMlResultRef.current = data.mlResult;
           startAgentPipeline(data.mlResult);
         } else if (data.mlResult?.status === "error") {
-          clearInterval(mlPollRef.current);
+          clearInterval(mlPollRef.current); mlPollRef.current = null;
           setErrMsg(data.mlResult.errorMessage || "ML training failed.");
           setPhase("error");
         }
-      } catch {}
+      } catch { /* network blip — retry */ }
     }, 3000);
   };
 
   const startAgentPipeline = async (trainedMlResult) => {
     if (agentStartedRef.current) return;
     agentStartedRef.current = true;
+    // FIX: store in ref so poll closure always reads the latest value
+    trainedMlResultRef.current = trainedMlResult;
+    agentPollCountRef.current  = 0;
     setPhase("running_agents"); setActiveAgent(0); scrollToTop();
     let step = 0;
     const stepTimer = setInterval(() => { step = Math.min(step + 1, 3); setActiveAgent(step); }, 2500);
     try {
-      const res  = await fetch(`${API}/ml/agent/${project.projectId}`, {
+      const res  = await fetchNocache(`${API}/ml/agent/${project.projectId}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uid: firebaseUser.uid }),
       });
@@ -968,33 +980,55 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
         setErrMsg(data.message || "Retrain required.");
         setPhase("error"); return;
       }
-      if (!res.ok) throw new Error(data.message);
-      let agentDone = false;
+      if (!res.ok) throw new Error(data.message || "Agent pipeline start failed.");
+
+      // FIX: Use a local done flag + ref-based mlResult to avoid stale closures
       agentPollRef.current = setInterval(async () => {
-        if (agentDone) return;
+        agentPollCountRef.current += 1;
+
+        // Safety timeout — 10 minutes of polling with no result
+        if (agentPollCountRef.current > MAX_AGENT_POLLS) {
+          clearInterval(agentPollRef.current); agentPollRef.current = null;
+          clearInterval(stepTimer);
+          setErrMsg("Agent pipeline timed out after 10 minutes. Please retry.");
+          setPhase("error");
+          return;
+        }
+
         try {
-          const r = await fetch(`${API}/ml/agent-result/${project.projectId}`);
+          // FIX: always cache-bust so Vercel/Render CDN never returns 304
+          const r = await fetchNocache(`${API}/ml/agent-result/${project.projectId}`);
+          if (!r.ok) return; // transient error — retry
           const d = await r.json();
+
           if (d.agentResult?.status === "complete") {
-            agentDone = true;
             clearInterval(agentPollRef.current); agentPollRef.current = null;
             clearInterval(stepTimer);
-            setAgentResult(d.agentResult); setActiveAgent(4); setPhase("complete"); scrollToTop();
-            if (onDone) onDone(d.agentResult, trainedMlResult || mlResult);
+            // FIX: read from ref — never stale, even inside interval closure
+            const finalMlResult = trainedMlResultRef.current;
+            setAgentResult(d.agentResult);
+            setActiveAgent(4);
+            setPhase("complete");
+            scrollToTop();
+            // FIX: call onDone with the correct mlResult from ref
+            if (onDone) onDone(d.agentResult, finalMlResult);
           } else if (d.agentResult?.status === "error") {
-            agentDone = true;
             clearInterval(agentPollRef.current); agentPollRef.current = null;
             clearInterval(stepTimer);
-            setErrMsg(d.agentResult.errorMessage || "Agent pipeline failed."); setPhase("error");
+            setErrMsg(d.agentResult.errorMessage || "Agent pipeline failed.");
+            setPhase("error");
           }
-        } catch {}
+        } catch { /* network blip — retry */ }
       }, 3000);
     } catch (err) { clearInterval(stepTimer); setErrMsg(err.message); setPhase("error"); }
   };
 
   const handleRetry = () => {
-    agentStartedRef.current = false; mlDoneRef.current = false;
+    agentStartedRef.current    = false;
+    mlDoneRef.current          = false;
     trainingStartedRef.current = false;
+    agentPollCountRef.current  = 0;
+    trainedMlResultRef.current = null;
     setErrMsg(""); setRequiresRetrain(false); setPhase("training_ml");
     setMlResult(null); setAgentResult(null); setActiveAgent(0);
     startMLTraining();
@@ -1006,6 +1040,19 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
     { label: "Simulation", desc: "KPI regressor ML projection",         color: C.pink,   icon: FiLoader    },
     { label: "Decision",   desc: "PKL-validated final ranking",         color: C.green,  icon: FiZap       },
   ];
+
+  // FIX: Safety net auto-navigate — if phase hits "complete" but onDone wasn't
+  // called (e.g. React batching delayed state update), trigger it after 1.5s.
+  const autoNavRef = useRef(false);
+  useEffect(() => {
+    if (phase === "complete" && agentResult && !autoNavRef.current) {
+      autoNavRef.current = true;
+      const timer = setTimeout(() => {
+        if (onDone) onDone(agentResult, trainedMlResultRef.current || mlResult);
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [phase, agentResult]);
   const modelColors = { randomForest: C.violet, xgboost: C.cyan, lightgbm: C.pink };
   const modelLabels = { randomForest: "Random Forest", xgboost: "XGBoost", lightgbm: "LightGBM" };
   const isProcessing = phase === "training_ml" || phase === "running_agents";
@@ -1158,6 +1205,7 @@ function Step4And5Auto({ project, currentObjective, savedSimMode, firebaseUser, 
           {phase === "complete" && agentResult && (
             <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="relative z-10">
               <motion.button
+                onClick={() => { if (onDone) onDone(agentResult, trainedMlResultRef.current || mlResult); }}
                 whileHover={{ scale: 1.02, boxShadow: "0 0 45px rgba(34,197,94,0.5)" }} whileTap={{ scale: 0.97 }}
                 className="w-full flex items-center justify-center gap-2 py-4 rounded-xl font-bold text-white text-base relative overflow-hidden"
                 style={{ background: "linear-gradient(135deg,#22C55E,#00E0FF)" }}>
@@ -1334,9 +1382,10 @@ function Step5AgentPipeline({
   const fetchExistingResults = async () => {
     try {
       setPhase("loading");
+      const ts = Date.now();
       const [agentRes, mlRes] = await Promise.all([
-        fetch(`${API}/ml/agent-result/${project.projectId}`).then(r => r.json()),
-        fetch(`${API}/ml/result/${project.projectId}`).then(r => r.json()),
+        fetch(`${API}/ml/agent-result/${project.projectId}?_t=${ts}`, { cache: "no-store" }).then(r => r.json()),
+        fetch(`${API}/ml/result/${project.projectId}?_t=${ts}`, { cache: "no-store" }).then(r => r.json()),
       ]);
       if (agentRes.agentResult?.status === "complete") {
         setAgentResult(agentRes.agentResult); setPhase("complete");
@@ -1360,9 +1409,20 @@ function Step5AgentPipeline({
   const startPolling = () => {
     let si = 0;
     const sI = setInterval(() => { si = Math.min(si + 1, 3); setActiveStep(si); }, 2000);
+    let pollCount = 0;
+    const MAX_POLLS = 200; // 10 min timeout
     pollRef.current = setInterval(async () => {
+      pollCount++;
+      if (pollCount > MAX_POLLS) {
+        clearInterval(pollRef.current); clearInterval(sI);
+        setPipelineErr("Agent pipeline timed out. Please retry.");
+        setPhase("error");
+        return;
+      }
       try {
-        const res  = await fetch(`${API}/ml/agent-result/${project.projectId}`);
+        // FIX: cache-bust to prevent 304 empty-body on Vercel/Render CDN
+        const res  = await fetch(`${API}/ml/agent-result/${project.projectId}?_t=${Date.now()}`, { cache: "no-store" });
+        if (!res.ok) return;
         const data = await res.json();
         if (data.agentResult?.status === "complete") {
           setAgentResult(data.agentResult); setPhase("complete"); setActiveStep(4);
@@ -1378,8 +1438,9 @@ function Step5AgentPipeline({
   const handleRunPipeline = async () => {
     setPipelineErr(""); setRequiresRetrain(false); setPhase("running"); setActiveStep(0);
     try {
-      const res  = await fetch(`${API}/ml/agent/${project.projectId}`, {
+      const res  = await fetch(`${API}/ml/agent/${project.projectId}?_t=${Date.now()}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
+        cache: "no-store",
         body: JSON.stringify({ uid: firebaseUser.uid }),
       });
       const data = await res.json();
@@ -2169,7 +2230,7 @@ export default function UserDashboard() {
     if (pollStatusRef.current) clearInterval(pollStatusRef.current);
     pollStatusRef.current = setInterval(async () => {
       try {
-        const res  = await fetch(`${API}/projects/status/${projectId}`);
+        const res  = await fetch(`${API}/projects/status/${projectId}?_t=${Date.now()}`, { cache: "no-store" });
         const data = await res.json();
         if (data.project) {
           setProject(prev => ({ ...prev, ...data.project }));
